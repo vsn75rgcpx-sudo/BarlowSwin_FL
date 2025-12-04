@@ -1,0 +1,12 @@
+# BarlowSwin_FL_full
+
+Prototype for Federated Differentiable NAS + 3D Swin-like segmentation model.
+
+Features:
+- Simplified Swin3D-like encoder + UNet 3D decoder.
+- Differentiable NAS via MixedOp3D and softmax alpha parameters.
+- Fed-DARTS-style alternating optimization skeleton (weights w and architecture α).
+- Weighted aggregation by client dataset size.
+- Learning rate scheduler, gradient clipping, AdamW weight decay.
+- Simple int8 quantization helpers for parameter compression.
+- Flower-based server and client skeletons.
