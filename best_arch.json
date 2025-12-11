@@ -28,20 +28,20 @@
             "blocks": [
                 {
                     "block_index": 0,
-                    "ffn_idx": 1,
-                    "ffn_choice": "Conv1x1x1",
-                    "attn_idx": 0,
+                    "ffn_idx": 3,
+                    "ffn_choice": "IdentityOp",
+                    "attn_idx": 1,
                     "attn_choice": {
                         "window_size": [
                             2,
                             6,
                             6
                         ],
-                        "num_heads": 2
+                        "num_heads": 4
                     },
-                    "gate_alpha": 0.0010508241830393672,
-                    "gate_value": 0.5002626776695251,
-                    "gate_keep": true,
+                    "gate_alpha": -0.0007495853351429105,
+                    "gate_value": 0.49981260299682617,
+                    "gate_keep": false,
                     "resolution": [
                         96,
                         96,
@@ -57,18 +57,18 @@
                     "block_index": 1,
                     "ffn_idx": 3,
                     "ffn_choice": "IdentityOp",
-                    "attn_idx": 0,
+                    "attn_idx": 1,
                     "attn_choice": {
                         "window_size": [
                             2,
                             6,
                             6
                         ],
-                        "num_heads": 2
+                        "num_heads": 4
                     },
-                    "gate_alpha": -0.0015250872820615768,
-                    "gate_value": 0.4996187090873718,
-                    "gate_keep": false,
+                    "gate_alpha": 0.0015488631324842572,
+                    "gate_value": 0.5003872513771057,
+                    "gate_keep": true,
                     "resolution": [
                         96,
                         96,
@@ -88,20 +88,20 @@
             "blocks": [
                 {
                     "block_index": 2,
-                    "ffn_idx": 3,
-                    "ffn_choice": "IdentityOp",
-                    "attn_idx": 2,
+                    "ffn_idx": 4,
+                    "ffn_choice": "Conv5x5x5",
+                    "attn_idx": 1,
                     "attn_choice": {
                         "window_size": [
                             2,
                             6,
                             6
                         ],
-                        "num_heads": 6
+                        "num_heads": 4
                     },
-                    "gate_alpha": -0.000382019963581115,
-                    "gate_value": 0.4999045431613922,
-                    "gate_keep": false,
+                    "gate_alpha": 0.0011681788600981236,
+                    "gate_value": 0.5002920627593994,
+                    "gate_keep": true,
                     "resolution": [
                         48,
                         48,
@@ -117,17 +117,17 @@
                     "block_index": 3,
                     "ffn_idx": 2,
                     "ffn_choice": "DepthwiseSeparable3D",
-                    "attn_idx": 1,
+                    "attn_idx": 2,
                     "attn_choice": {
                         "window_size": [
                             2,
                             6,
                             6
                         ],
-                        "num_heads": 4
+                        "num_heads": 6
                     },
-                    "gate_alpha": 0.000898716039955616,
-                    "gate_value": 0.5002247095108032,
+                    "gate_alpha": 0.0010239664698019624,
+                    "gate_value": 0.5002560019493103,
                     "gate_keep": true,
                     "resolution": [
                         48,
@@ -148,20 +148,20 @@
             "blocks": [
                 {
                     "block_index": 4,
-                    "ffn_idx": 2,
-                    "ffn_choice": "DepthwiseSeparable3D",
-                    "attn_idx": 1,
+                    "ffn_idx": 4,
+                    "ffn_choice": "Conv5x5x5",
+                    "attn_idx": 2,
                     "attn_choice": {
                         "window_size": [
                             2,
                             6,
                             6
                         ],
-                        "num_heads": 4
+                        "num_heads": 6
                     },
-                    "gate_alpha": -0.0005155815742909908,
-                    "gate_value": 0.4998711049556732,
-                    "gate_keep": false,
+                    "gate_alpha": 0.0008723447099328041,
+                    "gate_value": 0.5002180933952332,
+                    "gate_keep": true,
                     "resolution": [
                         24,
                         24,
@@ -175,19 +175,19 @@
                 },
                 {
                     "block_index": 5,
-                    "ffn_idx": 1,
-                    "ffn_choice": "Conv1x1x1",
-                    "attn_idx": 0,
+                    "ffn_idx": 4,
+                    "ffn_choice": "Conv5x5x5",
+                    "attn_idx": 2,
                     "attn_choice": {
                         "window_size": [
                             2,
                             6,
                             6
                         ],
-                        "num_heads": 2
+                        "num_heads": 6
                     },
-                    "gate_alpha": 0.0009885573526844382,
-                    "gate_value": 0.5002471208572388,
+                    "gate_alpha": 0.00044915193575434387,
+                    "gate_value": 0.5001122951507568,
                     "gate_keep": true,
                     "resolution": [
                         24,
@@ -208,19 +208,19 @@
             "blocks": [
                 {
                     "block_index": 6,
-                    "ffn_idx": 2,
-                    "ffn_choice": "DepthwiseSeparable3D",
-                    "attn_idx": 2,
+                    "ffn_idx": 1,
+                    "ffn_choice": "Conv1x1x1",
+                    "attn_idx": 1,
                     "attn_choice": {
                         "window_size": [
                             2,
                             6,
                             6
                         ],
-                        "num_heads": 6
+                        "num_heads": 4
                     },
-                    "gate_alpha": -0.0006014800164848566,
-                    "gate_value": 0.4998496174812317,
+                    "gate_alpha": -0.00011891277972608805,
+                    "gate_value": 0.4999702572822571,
                     "gate_keep": false,
                     "resolution": [
                         12,
@@ -235,8 +235,8 @@
                 },
                 {
                     "block_index": 7,
-                    "ffn_idx": 2,
-                    "ffn_choice": "DepthwiseSeparable3D",
+                    "ffn_idx": 3,
+                    "ffn_choice": "IdentityOp",
                     "attn_idx": 1,
                     "attn_choice": {
                         "window_size": [
@@ -246,9 +246,9 @@
                         ],
                         "num_heads": 4
                     },
-                    "gate_alpha": -0.0007011803681962192,
-                    "gate_value": 0.4998247027397156,
-                    "gate_keep": false,
+                    "gate_alpha": 0.0013196277432143688,
+                    "gate_value": 0.5003299117088318,
+                    "gate_keep": true,
                     "resolution": [
                         12,
                         12,

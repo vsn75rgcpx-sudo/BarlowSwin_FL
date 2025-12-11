@@ -29,7 +29,7 @@ class Toy3DDataset(torch.utils.data.Dataset):
         self.n = n
         self.shape = shape
         self.num_classes = num_classes
-        
+
         if n <= 0:
             raise ValueError(f"Dataset size must be > 0, got {n}")
 
@@ -62,12 +62,12 @@ def create_model():
         {"window_size": (2, 4, 4), "num_heads": 4},
         {"window_size": (2, 4, 4), "num_heads": 6},
     ]
-    
+
     return SwinUNet3D_NAS(
         in_channels=1,
         num_classes=4,
-        dims=(48,96,192,384),
-        depths=(2,2,2,2),
+        dims=(48, 96, 192, 384),
+        depths=(2, 2, 2, 2),
         window_candidates=window_candidates,
         ffn_op_names=None,  # Will use default: ["conv3","conv1","dw","identity","conv5"]
         drop_path_rate=0.1,
@@ -80,7 +80,6 @@ def create_model():
 # Federated Training Loop
 # ------------------------------------------------------------
 def main():
-
     # -----------------------------
     # Reproducibility
     # -----------------------------
@@ -89,7 +88,14 @@ def main():
     np.random.seed(seed)
     random.seed(seed)
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    # 优先使用 MPS (Mac) 或 CUDA
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif torch.backends.mps.is_available():
+        device = "mps"
+        print("[Init] Using Apple MPS acceleration.")
+    else:
+        device = "cpu"
 
     # -----------------------------
     # Configuration
@@ -163,12 +169,13 @@ def main():
                 grad_clip=1.0,
                 compress=COMPRESS,
                 compress_mode=COMPRESS_MODE,
-                topk_ratio=TOPK_RATIO
+                topk_ratio=TOPK_RATIO,
+                val_split_ratio=0.2  # Use 20% for validation
             )
             clients.append(client)
         except Exception as e:
             raise RuntimeError(f"Failed to create client {cid}: {e}")
-    
+
     if len(clients) != NUM_CLIENTS:
         raise RuntimeError(f"Expected {NUM_CLIENTS} clients, but created {len(clients)}")
 
@@ -182,6 +189,9 @@ def main():
         """
         model.eval()
         dices, psnrs, ssims = [], [], []
+
+        if len(dataloader) == 0:
+            return 0.0, 0.0, 0.0
 
         with torch.no_grad():
             for x, y in dataloader:
@@ -221,12 +231,12 @@ def main():
     # Federated training rounds
     # -----------------------------
     for rnd in range(ROUNDS):
-        print(f"\n========== Federated Round {rnd+1}/{ROUNDS} ==========")
+        print(f"\n========== Federated Round {rnd + 1}/{ROUNDS} ==========")
 
         try:
             # Sample all clients or subset
             selected = list(range(NUM_CLIENTS))
-            
+
             if len(selected) == 0:
                 print("[WARNING] No clients selected, skipping round")
                 continue
@@ -251,7 +261,7 @@ def main():
                 try:
                     print(f" Client {cid} training...")
                     result = clients[cid].train(global_state, global_alpha)
-                    
+
                     # Validate result
                     if result is None:
                         print(f"[WARNING] Client {cid} returned None, skipping")
@@ -265,10 +275,10 @@ def main():
                     if "size" not in result:
                         print(f"[WARNING] Client {cid} result missing 'size', skipping")
                         continue
-                    
+
                     client_results[cid] = result
                     successful_clients.append(cid)
-                    
+
                 except Exception as e:
                     print(f"[ERROR] Client {cid} training failed: {e}")
                     import traceback
@@ -290,7 +300,7 @@ def main():
                 server.federated_round(selected, client_results)
 
             # Save every round
-            save_path = f"checkpoint_round_{rnd+1}.pth"
+            save_path = f"checkpoint_round_{rnd + 1}.pth"
             try:
                 server.save(save_path)
                 print(f" Saved checkpoint to {save_path}")
@@ -298,53 +308,61 @@ def main():
                 print(f"[ERROR] Failed to save checkpoint: {e}")
                 import traceback
                 traceback.print_exc()
-            
-            # Evaluate on validation set (use first client's dataset as validation)
+
+            # Evaluate on validation set (use first client's validation set)
             try:
+                # [Fix]: Use val_loader instead of dataloader
+                eval_loader = clients[0].val_loader
+
+                # If val_loader is empty, fallback to train_loader just for testing pipeline
+                if len(eval_loader) == 0:
+                    print("[WARNING] Val loader empty, falling back to train loader for eval")
+                    eval_loader = clients[0].train_loader
+
                 val_dice, val_psnr, val_ssim = evaluate(
-                    server.global_model, 
-                    clients[0].dataloader, 
+                    server.global_model,
+                    eval_loader,
                     device
                 )
                 dice_history.append(val_dice)
                 psnr_history.append(val_psnr)
                 ssim_history.append(val_ssim)
-                print(f"[Round {rnd+1}] Dice={val_dice:.4f}, PSNR={val_psnr:.3f}, SSIM={val_ssim:.4f}")
+                print(f"[Round {rnd + 1}] Dice={val_dice:.4f}, PSNR={val_psnr:.3f}, SSIM={val_ssim:.4f}")
             except Exception as e:
                 print(f"[WARNING] Evaluation failed: {e}")
+                import traceback
+                traceback.print_exc()
                 # Append None to maintain history length
                 dice_history.append(None)
                 psnr_history.append(None)
                 ssim_history.append(None)
-                
+
         except KeyboardInterrupt:
             print("\n[INFO] Training interrupted by user")
             break
         except Exception as e:
-            print(f"[ERROR] Round {rnd+1} failed: {e}")
+            print(f"[ERROR] Round {rnd + 1} failed: {e}")
             import traceback
             traceback.print_exc()
-            # Decide whether to continue or stop
-            # For now, we'll continue to next round
             continue
 
     print("Training finished!")
-    
+
     # -----------------------------
     # Plot metrics curves
     # -----------------------------
     def plot_curve(values, name, out_dir="plots_retrain"):
         """Plot a single metric curve"""
         os.makedirs(out_dir, exist_ok=True)
-        
+
         # Filter out None values
         valid_values = [(i, v) for i, v in enumerate(values) if v is not None]
         if len(valid_values) == 0:
             print(f"[WARNING] No valid {name} values to plot")
             return
-        
+
         rounds, vals = zip(*valid_values)
-        
+
         plt.figure(figsize=(8, 5))
         plt.plot(rounds, vals, marker='o', linestyle='-', linewidth=2, markersize=6)
         plt.title(f"{name} Curve")
@@ -355,7 +373,7 @@ def main():
         plt.savefig(os.path.join(out_dir, f"{name.lower()}.png"), dpi=150)
         plt.close()
         print(f"  Saved {name} curve to {out_dir}/{name.lower()}.png")
-    
+
     print("\n===== GENERATING METRICS PLOTS =====")
     plot_curve(dice_history, "Dice")
     plot_curve(psnr_history, "PSNR")

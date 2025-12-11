@@ -10,6 +10,9 @@ This server handles:
   - Weighted averaging (FedAvg)
   - Compression (8-bit quant / top-k)
   - Global training loop control
+
+Modified:
+ - Fixed device mismatch error in aggregate_alpha (CPU vs MPS/CUDA).
 """
 
 import copy
@@ -69,14 +72,14 @@ def topk_sparsify(tensor: torch.Tensor, k=0.1):
 class FederatedServer:
 
     def __init__(
-        self,
-        model_fn,
-        num_clients,
-        device="cuda",
-        compress=False,
-        compress_mode="8bit",   # "8bit" or "topk"
-        topk_ratio=0.1,
-        alpha_lr=0.5,           # alpha update factor β
+            self,
+            model_fn,
+            num_clients,
+            device="cuda",
+            compress=False,
+            compress_mode="8bit",  # "8bit" or "topk"
+            topk_ratio=0.1,
+            alpha_lr=0.5,  # alpha update factor β
     ):
         """
         Args:
@@ -103,7 +106,7 @@ class FederatedServer:
             p.clone().detach()
             for p in self.global_model.arch_parameters()
         ]
-        
+
         # Dice history for plotting
         self.train_dice_history = []
         self.val_dice_history = []
@@ -116,10 +119,10 @@ class FederatedServer:
         Return weights for clients. Optionally compress.
         """
         state = self.global_model.state_dict()
-        
+
         # Filter out alpha and gate keys (they're not registered parameters, managed separately)
-        filtered_state = {k: v for k, v in state.items() 
-                         if not k.endswith('.alpha') and not k.endswith('.gate')}
+        filtered_state = {k: v for k, v in state.items()
+                          if not k.endswith('.alpha') and not k.endswith('.gate')}
 
         if not self.compress:
             return filtered_state
@@ -156,11 +159,11 @@ class FederatedServer:
         """
         if not client_weights or len(client_weights) == 0:
             return {}
-        
+
         total = sum(client_sizes)
         if total == 0:
             return {}
-        
+
         new_state = {}
 
         # reference
@@ -184,14 +187,15 @@ class FederatedServer:
         """
         if not client_alphas or len(client_alphas) == 0:
             return  # No alpha to aggregate
-        
+
         if len(client_alphas[0]) == 0:
             return  # Empty alpha list
-        
+
         total = sum(client_sizes)
         if total == 0:
             return  # Avoid division by zero
-        
+
+        # Calculate weighted average from clients (on CPU usually)
         weighted_sum = [
             sum(a[j] * (client_sizes[i] / total)
                 for i, a in enumerate(client_alphas))
@@ -201,6 +205,8 @@ class FederatedServer:
         # update rule
         new_alphas = []
         for g, w in zip(self.global_alphas, weighted_sum):
+            # [Fix] Ensure incoming weight 'w' is on the same device as global 'g' (e.g. MPS/CUDA)
+            w = w.to(g.device)
             new = (1 - self.alpha_lr) * g + self.alpha_lr * w
             new_alphas.append(new.detach())
 
@@ -213,7 +219,7 @@ class FederatedServer:
     def apply_alpha_to_model(self):
         if len(self.global_alphas) == 0:
             return  # No alpha to apply
-        
+
         # Check if model has set_alpha method (new NAS model)
         if hasattr(self.global_model, 'set_alpha'):
             # New NAS model: use set_alpha method
