@@ -1,5 +1,5 @@
 """
-train_fednas_full.py (Final with Pretrained Weights Loading)
+train_fednas_full.py (50 Rounds Version)
 --------------------
 Integrated pipeline:
   1. FedNAS search stage (Loads 'encoder_pretrained.pth' if available)
@@ -8,8 +8,8 @@ Integrated pipeline:
   4. Auto-plotting
 
 Modified:
- - Automatically loads 'encoder_pretrained.pth' for the search stage.
- - Increased default batch size for A40 GPU.
+ - Increased Search and Retrain rounds to 50 for better convergence.
+ - Automatically loads 'encoder_pretrained.pth'.
 """
 
 import os
@@ -144,12 +144,10 @@ def get_model_factory(in_channels, resolution, num_classes=4, init_barlow_path=N
             nas=True,
             drop_path_rate=0.1
         )
-        # [NEW] Auto-load pretrained weights if available
         if init_barlow_path and os.path.exists(init_barlow_path):
             try:
                 ckpt = torch.load(init_barlow_path, map_location="cpu")
                 model_dict = model.state_dict()
-                # 过滤并加载匹配的权重 (Encoder部分)
                 pretrained_dict = {k: v for k, v in ckpt.items()
                                    if k in model_dict and v.size() == model_dict[k].size()}
                 model_dict.update(pretrained_dict)
@@ -310,11 +308,11 @@ def federated_retrain(num_clients, datasets, rounds, arch_json, device, in_chann
             model_fn=model_fn,
             dataset=datasets[i],
             device=device,
-            epochs=2,  # [Optim] Increase epochs for retraining
-            lr=3e-4,  # [Optim] Slightly higher learning rate
+            epochs=2,
+            lr=3e-4,
             lr_alpha=0.0,
             val_split_ratio=0.0,
-            batch_size=8  # [A40 Optim] Larger batch for fixed model
+            batch_size=8
         ) for i in range(num_clients)
     ]
 
@@ -410,14 +408,14 @@ def main():
     in_channels, resolution = infer_input_shape(datasets[0])
     print(f"[Auto-Detect] in_channels={in_channels}, resolution={resolution}")
 
-    # 1. Search (Increase rounds for better convergence on A40)
-    server_search = federated_search_stage(num_clients, datasets, 10, device, in_channels, resolution)
+    # 1. Search (50 Rounds)
+    server_search = federated_search_stage(num_clients, datasets, 50, device, in_channels, resolution)
 
     # 2. Export
     json_path = export_arch_step(server_search)
 
-    # 3. Retrain (Increase rounds)
-    federated_retrain(num_clients, datasets, 10, json_path, device, in_channels, resolution)
+    # 3. Retrain (50 Rounds)
+    federated_retrain(num_clients, datasets, 50, json_path, device, in_channels, resolution)
 
     # 4. Plot
     try:
