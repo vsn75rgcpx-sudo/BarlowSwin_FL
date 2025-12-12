@@ -43,7 +43,7 @@ def parse_args():
     parser.add_argument("--barlow_hidden", type=int, default=512)
     parser.add_argument("--barlow_out", type=int, default=1024, 
                         help="Projector output dim (512-1024 recommended for 3D small batch)")
-    parser.add_argument("--barlow_bs", type=int, default=1, 
+    parser.add_argument("--barlow_bs", type=int, default=8,
                         help="Batch size per client for BT training")
     parser.add_argument("--barlow_lr", type=float, default=1e-4)
     parser.add_argument("--barlow_lambda", type=float, default=0.005)
