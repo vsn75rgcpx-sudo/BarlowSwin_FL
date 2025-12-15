@@ -1,13 +1,11 @@
 """
-train_fixed_model.py (Final Version with Real Data)
+train_fixed_model.py (Enhanced Metrics Version)
 --------------------
-Non-Federated final training script for SwinUNet3D_Fixed.
-
 Pipeline:
  1. Load fixed architecture JSON (best_arch.json)
- 2. Construct SwinUNet3D_Fixed
- 3. Train on MRI dataset (Real BraTS Data)
- 4. Save best model (based on validation loss or Dice)
+ 2. Train on MRI dataset (Real BraTS Data)
+ 3. Evaluate F1, Jaccard, HD95, PA, SSIM
+ 4. Save metrics plots and checkpoints to dedicated folders
 """
 
 import os
@@ -19,12 +17,34 @@ import numpy as np
 import random
 import nibabel as nib
 import glob
+import matplotlib.pyplot as plt
+import json
 
 from model_swin3d.swin3d_unet_fixed import SwinUNet3D_Fixed
+# 导入我们刚刚更新的 metrics 模块
+from metrics import f1_score, jaccard_score, pixel_accuracy, compute_hd95, ssim3d
 
 
 # ============================================================
-# BraTS Dataset (Copy from train_fednas_full.py)
+# Directory Setup Helper
+# ============================================================
+def setup_output_dirs(base_dir="output_results"):
+    dirs = {
+        "f1": os.path.join(base_dir, "F1_Score"),
+        "jaccard": os.path.join(base_dir, "Jaccard_IoU"),
+        "hd95": os.path.join(base_dir, "HD95"),
+        "pa": os.path.join(base_dir, "Pixel_Accuracy"),
+        "ssim": os.path.join(base_dir, "SSIM"),
+        "ckpt": os.path.join(base_dir, "Checkpoints"),
+        "plots": os.path.join(base_dir, "Plots_Overview")
+    }
+    for d in dirs.values():
+        os.makedirs(d, exist_ok=True)
+    return dirs
+
+
+# ============================================================
+# BraTS Dataset
 # ============================================================
 class BraTSDataset(Dataset):
     def __init__(self, root_dir, case_ids, target_shape=(96, 96, 96), augment=False):
@@ -110,7 +130,7 @@ class BraTSDataset(Dataset):
 
 
 # ------------------------------------------------------------
-# Dice Loss for multi-class segmentation
+# Dice Loss
 # ------------------------------------------------------------
 class DiceLoss(nn.Module):
     def __init__(self, eps=1e-6):
@@ -122,7 +142,6 @@ class DiceLoss(nn.Module):
         probs = torch.softmax(logits, dim=1)
         targets_onehot = torch.nn.functional.one_hot(targets, num_classes)
         targets_onehot = targets_onehot.permute(0, 4, 1, 2, 3).float()
-
         dims = (0, 2, 3, 4)
         intersection = torch.sum(probs * targets_onehot, dims)
         cardinality = torch.sum(probs + targets_onehot, dims)
@@ -131,47 +150,78 @@ class DiceLoss(nn.Module):
 
 
 # ------------------------------------------------------------
-# Training loop
+# Training & Eval Functions
 # ------------------------------------------------------------
 def train_one_epoch(model, loader, optim, criterion, device):
     model.train()
     total_loss = 0
-
     for x, y in loader:
         x, y = x.to(device), y.to(device)
-
         optim.zero_grad()
         logits = model(x)
         loss = criterion(logits, y)
         loss.backward()
-
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optim.step()
-
         total_loss += loss.item()
-
     return total_loss / len(loader)
 
 
-def eval_one_epoch(model, loader, criterion, device):
+def eval_full_metrics(model, loader, criterion, device):
+    """
+    Evaluate model and return dictionary of all metrics.
+    """
     model.eval()
-    total_loss = 0
+    metrics = {
+        "val_loss": [], "f1": [], "jaccard": [],
+        "hd95": [], "pa": [], "ssim": []
+    }
 
     with torch.no_grad():
         for x, y in loader:
             x, y = x.to(device), y.to(device)
             logits = model(x)
-            loss = criterion(logits, y)
-            total_loss += loss.item()
 
-    return total_loss / len(loader)
+            # 1. Loss
+            loss = criterion(logits, y)
+            metrics["val_loss"].append(loss.item())
+
+            # 2. Metrics
+            metrics["f1"].append(f1_score(logits, y))
+            metrics["jaccard"].append(jaccard_score(logits, y))
+            metrics["pa"].append(pixel_accuracy(logits, y))
+            metrics["ssim"].append(ssim3d(logits, y))
+
+            # HD95 比较慢，如果数据量大可以考虑每N个Epoch算一次
+            # 这里默认每次都算
+            metrics["hd95"].append(compute_hd95(logits, y))
+
+    # Calculate means
+    avg_metrics = {k: np.mean(v) for k, v in metrics.items()}
+    return avg_metrics
+
+
+def save_metric_plot(history, metric_name, save_dir, filename):
+    plt.figure(figsize=(10, 6))
+    rounds = range(1, len(history) + 1)
+    plt.plot(rounds, history, 'o-', label=f'{metric_name}')
+    plt.title(f'{metric_name} Curve')
+    plt.xlabel('Epochs')
+    plt.ylabel(metric_name)
+    plt.grid(True)
+    plt.legend()
+    plt.savefig(os.path.join(save_dir, filename))
+    plt.close()
 
 
 # ------------------------------------------------------------
-# Main training
+# Main
 # ------------------------------------------------------------
 def main(args):
-    # 优先使用 MPS (Mac) 或 CUDA
+    # Setup Output Dirs
+    out_dirs = setup_output_dirs(args.output_dir)
+
+    # Device
     if torch.cuda.is_available():
         device = "cuda"
     elif torch.backends.mps.is_available():
@@ -180,9 +230,7 @@ def main(args):
     else:
         device = "cpu"
 
-    # -----------------------------
     # 1. Prepare Data
-    # -----------------------------
     data_root = "dataset"
     if not os.path.exists(data_root):
         raise ValueError("Dataset folder not found!")
@@ -195,10 +243,8 @@ def main(args):
 
     if len(all_case_ids) == 0:
         raise ValueError("No valid BraTS cases found in dataset/.")
-
     print(f"[Init] Found {len(all_case_ids)} cases.")
 
-    # 简单划分 Train/Val (80/20)
     split_idx = int(len(all_case_ids) * 0.8)
     train_ids = all_case_ids[:split_idx]
     val_ids = all_case_ids[split_idx:]
@@ -207,11 +253,9 @@ def main(args):
     val_set = BraTSDataset(data_root, val_ids, target_shape=(96, 96, 96), augment=False)
 
     train_loader = DataLoader(train_set, batch_size=args.batch, shuffle=True)
-    val_loader = DataLoader(val_set, batch_size=1)  # 验证集 batch=1 更稳妥
+    val_loader = DataLoader(val_set, batch_size=1)
 
-    # -----------------------------
-    # 2. Load fixed architecture
-    # -----------------------------
+    # 2. Load Model
     model = SwinUNet3D_Fixed(
         in_channels=4,
         num_classes=args.num_classes,
@@ -221,59 +265,103 @@ def main(args):
         window_size=(2, 6, 6)
     ).to(device)
 
-    print(f"[OK] Loaded fixed architecture: {args.arch_path}")
-    print(f"Model params: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
-
-    # -----------------------------
-    # 3. Optimizer and Loss
-    # -----------------------------
-    optim = torch.optim.AdamW(
-        model.parameters(),
-        lr=args.lr,
-        weight_decay=1e-5
-    )
-
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optim, T_max=args.epochs
-    )
-
+    optim = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-5)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=args.epochs)
     criterion = DiceLoss()
 
-    # -----------------------------
-    # 4. Training loop
-    # -----------------------------
-    best_loss = 1e9
-    os.makedirs("checkpoints_fixed", exist_ok=True)
+    # History Recording
+    history = {
+        "train_loss": [], "val_loss": [],
+        "f1": [], "jaccard": [], "hd95": [], "pa": [], "ssim": []
+    }
 
-    print("Start training on Real Data...")
+    best_score = -1  # Based on F1
+
+    print("Start training...")
     for epoch in range(args.epochs):
-        train_loss = train_one_epoch(model, train_loader, optim, criterion, device)
-        val_loss = eval_one_epoch(model, val_loader, criterion, device)
+        # Train
+        t_loss = train_one_epoch(model, train_loader, optim, criterion, device)
+
+        # Eval
+        metrics = eval_full_metrics(model, val_loader, criterion, device)
+
         scheduler.step()
 
-        print(f"Epoch[{epoch + 1}/{args.epochs}]  "
-              f"Train: {train_loss:.4f}  Val: {val_loss:.4f}")
+        # Update History
+        history["train_loss"].append(t_loss)
+        history["val_loss"].append(metrics["val_loss"])
+        history["f1"].append(metrics["f1"])
+        history["jaccard"].append(metrics["jaccard"])
+        history["hd95"].append(metrics["hd95"])
+        history["pa"].append(metrics["pa"])
+        history["ssim"].append(metrics["ssim"])
 
-        # save best
-        if val_loss < best_loss:
-            best_loss = val_loss
-            save_path = f"checkpoints_fixed/best_model.pth"
+        print(f"Epoch[{epoch + 1}/{args.epochs}] "
+              f"T-Loss:{t_loss:.4f} V-Loss:{metrics['val_loss']:.4f} | "
+              f"F1:{metrics['f1']:.4f} IoU:{metrics['jaccard']:.4f} "
+              f"HD95:{metrics['hd95']:.2f} PA:{metrics['pa']:.4f} SSIM:{metrics['ssim']:.4f}")
+
+        # Save Best Model (Based on F1 Score)
+        if metrics["f1"] > best_score:
+            best_score = metrics["f1"]
+            save_path = os.path.join(out_dirs["ckpt"], "best_model.pth")
             torch.save(model.state_dict(), save_path)
-            print(f"  [OK] Saved best model to {save_path}")
+            print(f"  [*] Best model saved (F1={best_score:.4f})")
 
-    print("\nTraining finished!")
-    print("Best Val Loss =", best_loss)
+        # Save Regular Checkpoint
+        if (epoch + 1) % 5 == 0:
+            ckpt_path = os.path.join(out_dirs["ckpt"], f"epoch_{epoch + 1}.pth")
+            torch.save(model.state_dict(), ckpt_path)
+
+        # ----------------------------------------
+        # Plotting & Saving every epoch
+        # ----------------------------------------
+        # Save plots to their specific folders
+        save_metric_plot(history["f1"], "F1 Score", out_dirs["f1"], "f1_curve.png")
+        save_metric_plot(history["jaccard"], "Jaccard Index", out_dirs["jaccard"], "jaccard_curve.png")
+        save_metric_plot(history["hd95"], "HD95", out_dirs["hd95"], "hd95_curve.png")
+        save_metric_plot(history["pa"], "Pixel Accuracy", out_dirs["pa"], "pa_curve.png")
+        save_metric_plot(history["ssim"], "SSIM", out_dirs["ssim"], "ssim_curve.png")
+
+        # Save overview plot
+        plt.figure(figsize=(12, 8))
+        plt.subplot(2, 3, 1);
+        plt.plot(history["f1"]);
+        plt.title("F1")
+        plt.subplot(2, 3, 2);
+        plt.plot(history["jaccard"]);
+        plt.title("IoU")
+        plt.subplot(2, 3, 3);
+        plt.plot(history["hd95"]);
+        plt.title("HD95")
+        plt.subplot(2, 3, 4);
+        plt.plot(history["pa"]);
+        plt.title("PA")
+        plt.subplot(2, 3, 5);
+        plt.plot(history["ssim"]);
+        plt.title("SSIM")
+        plt.subplot(2, 3, 6);
+        plt.plot(history["train_loss"], label='Train');
+        plt.plot(history["val_loss"], label='Val');
+        plt.title("Loss");
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(os.path.join(out_dirs["plots"], "metrics_overview.png"))
+        plt.close()
+
+    # Save Logs to JSON
+    with open(os.path.join(args.output_dir, "training_metrics.json"), "w") as f:
+        json.dump(history, f, indent=4)
+
+    print("\nTraining finished! All results saved to", args.output_dir)
 
 
-# ------------------------------------------------------------
-# Args
-# ------------------------------------------------------------
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-
     parser.add_argument("--arch_path", type=str, default="best_arch.json")
-    parser.add_argument("--epochs", type=int, default=50)  # 真实训练可以多跑一些 epoch
-    parser.add_argument("--batch", type=int, default=2)  # 显存够的话可以开大一点
+    parser.add_argument("--output_dir", type=str, default="output_results")
+    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--batch", type=int, default=2)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--num_classes", type=int, default=4)
 
