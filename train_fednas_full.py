@@ -1,5 +1,5 @@
 """
-train_fednas_full.py (50 Rounds Version)
+train_fednas_full.py (50 Rounds + Multi-GPU Fix Version)
 --------------------
 Integrated pipeline:
   1. FedNAS search stage (Loads 'encoder_pretrained.pth' if available)
@@ -8,8 +8,7 @@ Integrated pipeline:
   4. Auto-plotting
 
 Modified:
- - Increased Search and Retrain rounds to 50 for better convergence.
- - Automatically loads 'encoder_pretrained.pth'.
+ - [FIX] Added DataParallelPassthrough to fix 'AttributeError: arch_parameters'.
 """
 
 import os
@@ -30,6 +29,18 @@ from model_swin3d.swin3d_unet_fixed import SwinUNet3D_Fixed
 
 from analysis.log_helpers import append_round_log
 from analysis import plot_metrics
+
+
+# ============================================================
+# [FIX] Custom DataParallel to expose underlying methods
+# ============================================================
+class DataParallelPassthrough(torch.nn.DataParallel):
+    def __getattr__(self, name):
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            # If DataParallel doesn't have it, ask the inner module
+            return getattr(self.module, name)
 
 
 # ============================================================
@@ -125,7 +136,7 @@ def infer_input_shape(dataset):
 
 
 # ============================================================
-# Model Factory Helper
+# Model Factory Helper (Updated with Fix)
 # ============================================================
 def get_model_factory(in_channels, resolution, num_classes=4, init_barlow_path=None, arch_json=None, mode="nas"):
     def create_nas():
@@ -156,12 +167,18 @@ def get_model_factory(in_channels, resolution, num_classes=4, init_barlow_path=N
                     f"[Factory] Loaded PRETRAINED weights from {init_barlow_path} ({len(pretrained_dict)} layers matched)")
             except Exception as e:
                 print(f"[Factory] Warning: Failed to load Barlow weights: {e}")
+
+        # [FIX] Use Custom DataParallelPassthrough
+        if torch.cuda.device_count() > 1:
+            print(f"[Factory-NAS] Detected {torch.cuda.device_count()} GPUs. Wrapping in DataParallelPassthrough.")
+            model = DataParallelPassthrough(model)
+
         return model
 
     def create_fixed():
         if arch_json is None:
             raise ValueError("arch_json required for fixed mode")
-        return SwinUNet3D_Fixed(
+        model = SwinUNet3D_Fixed(
             in_channels=in_channels,
             num_classes=num_classes,
             dims=(48, 96, 192, 384),
@@ -169,6 +186,13 @@ def get_model_factory(in_channels, resolution, num_classes=4, init_barlow_path=N
             arch_json=arch_json,
             window_size=(2, 6, 6)
         )
+
+        # [FIX] Use Custom DataParallelPassthrough
+        if torch.cuda.device_count() > 1:
+            print(f"[Factory-Fixed] Detected {torch.cuda.device_count()} GPUs. Wrapping in DataParallelPassthrough.")
+            model = DataParallelPassthrough(model)
+
+        return model
 
     if mode == "nas":
         return create_nas
@@ -210,11 +234,13 @@ def federated_search_stage(num_clients, datasets, rounds, device, in_channels, r
             sample_temperature=5.0,
             lambda_flops=1e-4,
             val_split_ratio=0.1,
-            batch_size=4  # [A40 Optim] Increased batch size for search
+            batch_size=8
         ) for i in range(num_clients)
     ]
 
     print("===== START FEDNAS SEARCH =====")
+    if torch.cuda.device_count() > 1:
+        print(f"[System] Multi-GPU Mode Enabled: Using {torch.cuda.device_count()} GPUs.")
 
     for rnd in range(rounds):
         print(f"\n===== SEARCH ROUND {rnd + 1}/{rounds} =====")
@@ -263,12 +289,17 @@ def federated_search_stage(num_clients, datasets, rounds, device, in_channels, r
 # ============================================================
 def export_arch_step(server, path_json="best_arch.json"):
     print("\n===== EXPORT BEST ARCHITECTURE =====")
-    if hasattr(server.global_model, 'set_alpha'):
-        server.global_model.set_alpha()
 
-    export_best_architecture(server.global_model, output_path=path_json)
+    # Unwrap DataParallel if exists
+    raw_model = server.global_model.module if isinstance(server.global_model,
+                                                         torch.nn.DataParallel) else server.global_model
 
-    full_state = server.global_model.state_dict()
+    if hasattr(raw_model, 'set_alpha'):
+        raw_model.set_alpha()
+
+    export_best_architecture(raw_model, output_path=path_json)
+
+    full_state = raw_model.state_dict()
     clean_state = {}
     for k, v in full_state.items():
         if "alpha" not in k and "gate" not in k:
@@ -297,7 +328,9 @@ def federated_retrain(num_clients, datasets, rounds, arch_json, device, in_chann
     if os.path.exists("fixed_model_initial.pth"):
         try:
             ckpt = torch.load("fixed_model_initial.pth", map_location=device)
-            server.global_model.load_state_dict(ckpt, strict=False)
+            raw_model = server.global_model.module if isinstance(server.global_model,
+                                                                 torch.nn.DataParallel) else server.global_model
+            raw_model.load_state_dict(ckpt, strict=False)
             print("[Retrain] Loaded warm-start weights.")
         except Exception as e:
             print(f"[Retrain] Warm start failed: {e}")
