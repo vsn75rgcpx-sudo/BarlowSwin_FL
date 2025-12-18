@@ -1,30 +1,42 @@
 """
-train_federated_fixed.py
+train_federated_fixed.py (加速版)
 ------------------------
-Federated Retraining with Fixed Architecture.
-Skips the search phase and trains a fixed model defined in best_arch.json.
+集成特性：
+ 1. 自动开启双卡 (DataParallelPassthrough)
+ 2. 增大 Batch Size (16)
+ 3. 增加 Local Epochs (5)
+ 4. 自动读取 best_arch.json 进行重训练
 """
 
 import os
 import random
 import torch
+import torch.nn as nn
 import numpy as np
 import glob
+from torch.utils.data import Dataset
+import nibabel as nib
 
 # 复用已有的模块
 from federated.fl_server import FederatedServer
 from federated.fl_client import FederatedClient
-from model_swin3d.swin3d_unet_fixed import SwinUNet3D_Fixed  # 使用固定模型
-from datasets.custom_multimodal_dataset import MultiModalSingleFolderDataset  # 假设你有这个，或者用 BraTSDataset
-from analysis.log_helpers import append_round_log
+from model_swin3d.swin3d_unet_fixed import SwinUNet3D_Fixed
+
 
 # ============================================================
-# BraTS Dataset (复用之前的定义)
+# [关键修改] 自定义 DataParallel，防止访问属性报错
 # ============================================================
-from torch.utils.data import Dataset
-import nibabel as nib
+class DataParallelPassthrough(torch.nn.DataParallel):
+    def __getattr__(self, name):
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(self.module, name)
 
 
+# ============================================================
+# BraTS Dataset
+# ============================================================
 class BraTSDataset(Dataset):
     def __init__(self, root_dir, case_ids, target_shape=(96, 96, 96), augment=False):
         self.root_dir = root_dir
@@ -123,11 +135,11 @@ def main():
 
     # Config
     NUM_CLIENTS = 4
-    ROUNDS = 50  # 训练轮数
-    ARCH_JSON = "best_arch.json"  # 必须存在
+    ROUNDS = 50
+    ARCH_JSON = "best_arch.json"
 
     if not os.path.exists(ARCH_JSON):
-        raise FileNotFoundError(f"Cannot find {ARCH_JSON}. Please run search phase first or provide a json.")
+        raise FileNotFoundError(f"Cannot find {ARCH_JSON}. Please run search phase first.")
 
     # 1. Prepare Data
     data_root = "dataset"
@@ -146,14 +158,21 @@ def main():
 
     # 2. Model Factory (Fixed Architecture)
     def create_fixed_model():
-        return SwinUNet3D_Fixed(
+        model = SwinUNet3D_Fixed(
             in_channels=4,
             num_classes=4,
             dims=(48, 96, 192, 384),
             depths=(2, 2, 2, 2),
             arch_json=ARCH_JSON,
-            window_size=(2, 6, 6)  # 必须与 search 时一致
+            window_size=(2, 6, 6)
         )
+
+        # [关键修改] 自动检测双卡并包装
+        if torch.cuda.device_count() > 1:
+            print(f"[System] Using {torch.cuda.device_count()} GPUs for Retraining!")
+            model = DataParallelPassthrough(model)
+
+        return model
 
     # 3. Server
     server = FederatedServer(
@@ -170,17 +189,19 @@ def main():
             cid=i,
             model_fn=create_fixed_model,
             dataset=datasets[i],
-            batch_size=2,
-            epochs=1,
+            # [关键修改] 增大 Batch Size 到 16，提高 GPU 利用率
+            # [关键修改] 增加 Epochs 到 5，每轮多练几次
+            batch_size=16,
+            epochs=5,
             device=device,
             lr=1e-4,
-            lr_alpha=0.0,  # 关键：Alpha 学习率为 0
-            val_split_ratio=0.0  # 不需要验证集来更新架构
+            lr_alpha=0.0,
+            val_split_ratio=0.0
         )
         clients.append(client)
 
     # 5. Training Loop
-    print("===== START FEDERATED TRAINING (FIXED ARCH) =====")
+    print("===== START FEDERATED TRAINING (FIXED ARCH - FAST MODE) =====")
     for rnd in range(ROUNDS):
         print(f"\n--- Round {rnd + 1}/{ROUNDS} ---")
 
@@ -189,7 +210,6 @@ def main():
         losses = []
 
         for cid in range(NUM_CLIENTS):
-            # 这里的 global_alpha 传空列表即可，因为模型是 Fixed 的
             res = clients[cid].train(global_weights, [])
             results[cid] = res
             if res.get("loss"): losses.append(res["loss"])
