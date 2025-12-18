@@ -5,7 +5,7 @@ Evaluation metrics for 3D segmentation:
 - dice_score (F1)
 - jaccard_score (mIoU)
 - pixel_accuracy (PA)
-- mean_pixel_accuracy (MPA)
+- mean_pixel_accuracy (MPA) [New]
 - hd95
 """
 
