@@ -186,8 +186,14 @@ class SwinUNet3D_Fixed(nn.Module):
     ):
         super().__init__()
 
-        with open(arch_json, "r") as f:
-            arch = json.load(f)
+        # Load architecture
+        if isinstance(arch_json, dict):
+            # 如果传进来的是字典，直接用
+            config = arch_json
+        else:
+            # 如果传进来的是路径(str)，则读取文件
+            with open(arch_json, "r") as f:
+                config = json.load(f)
 
         def map_op_name(class_name):
             name_lower = class_name.lower()
@@ -207,8 +213,9 @@ class SwinUNet3D_Fixed(nn.Module):
         self.chosen_operators = []
         self.block_keeps = []
 
-        if "stages" in arch:
-            stages_sorted = sorted(arch["stages"], key=lambda x: x["stage_id"])
+        # [修复点]: 这里之前写成了 if "stages" in arch，现改为 config
+        if "stages" in config:
+            stages_sorted = sorted(config["stages"], key=lambda x: x["stage_id"])
             for stage in stages_sorted:
                 stage_ops = []
                 stage_keeps = []
@@ -220,8 +227,8 @@ class SwinUNet3D_Fixed(nn.Module):
 
                 self.chosen_operators.append(stage_ops)
                 self.block_keeps.append(stage_keeps)
-        elif "ops" in arch:
-            flat_ops = arch["ops"]
+        elif "ops" in config: # [修复点]: 同上，改为 config
+            flat_ops = config["ops"] # [修复点]: 同上，改为 config
             ptr = 0
             for d in depths:
                 s_ops = []
@@ -237,7 +244,8 @@ class SwinUNet3D_Fixed(nn.Module):
                 self.chosen_operators.append(s_ops)
                 self.block_keeps.append(s_keeps)
         else:
-            raise ValueError("Invalid JSON format")
+            # 调试信息
+            raise ValueError(f"Invalid JSON format. Keys found: {list(config.keys())}")
 
         self.patch_embed = PatchEmbed3D(in_channels, dims[0], patch_size=2)
         self.depths = depths
