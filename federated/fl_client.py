@@ -3,7 +3,8 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 import numpy as np
-from losses import NewCombinedLoss  # 导入新 Loss
+from losses import NewCombinedLoss
+import metrics  # [新增] 必须导入 metrics 才能计算 Dice
 
 
 class FederatedClient:
@@ -68,7 +69,7 @@ class FederatedClient:
 
         self.optimizer = optim.AdamW(weight_params, lr=self.lr, weight_decay=self.weight_decay)
 
-        # [新增] 学习率调度器: 余弦退火
+        # 学习率调度器: 余弦退火
         self.scheduler = optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=self.epochs, eta_min=1e-6)
 
         self.alpha_optimizer = None
@@ -76,8 +77,7 @@ class FederatedClient:
             self.alpha_optimizer = optim.Adam(self.model.alpha_mgr.parameters(),
                                               lr=self.lr_alpha, betas=(0.5, 0.999), weight_decay=1e-3)
 
-        # 4. Loss Function (使用 Dice + CE + Boundary)
-        # weight_boundary 可根据需要调整
+        # 4. Loss Function
         criterion = NewCombinedLoss(weight_dice=1.0, weight_ce=1.0, weight_boundary=0.01).to(self.device)
 
         # 5. Training Loop
@@ -89,7 +89,7 @@ class FederatedClient:
             for batch_idx, (data, target) in enumerate(self.train_loader):
                 data, target = data.to(self.device), target.to(self.device)
 
-                # Step A: Architecture Update (如果需要)
+                # Step A: Architecture Update
                 if self.alpha_optimizer:
                     self.alpha_optimizer.zero_grad()
                     output = self.model(data)
@@ -113,10 +113,30 @@ class FederatedClient:
 
             # Step C: 更新学习率
             self.scheduler.step()
-
             epoch_losses.append(np.mean(batch_losses))
 
-        # 6. Return Results
+        # =========================================================
+        # [新增] 6. Validation Step (计算 Dice)
+        # =========================================================
+        val_dice = 0.0
+        if self.val_loader:
+            self.model.eval()
+            val_dices = []
+            with torch.no_grad():
+                for data, target in self.val_loader:
+                    data, target = data.to(self.device), target.to(self.device)
+                    output = self.model(data)
+
+                    # 调用 metrics 计算 Dice (metrics.py 中定义的函数)
+                    # 注意：metrics.dice_score 内部处理了 argmax
+                    d = metrics.dice_score(output, target)
+                    val_dices.append(d)
+
+            val_dice = np.mean(val_dices) if len(val_dices) > 0 else 0.0
+            self.model.train()  # 恢复为训练模式
+        # =========================================================
+
+        # 7. Return Results
         updated_alphas = []
         if hasattr(self.model, 'alpha_mgr') and self.model.alpha_mgr is not None:
             for p in self.model.alpha_mgr.parameters():
@@ -126,5 +146,6 @@ class FederatedClient:
             "weights": self.model.state_dict(),
             "alpha": updated_alphas,
             "loss": np.mean(epoch_losses) if epoch_losses else 0.0,
-            "size": len(self.train_ds)
+            "size": len(self.train_ds),
+            "val_dice": val_dice  # [新增] 返回计算好的 Dice
         }
