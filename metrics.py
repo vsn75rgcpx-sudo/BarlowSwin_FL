@@ -1,14 +1,3 @@
-"""
-metrics.py
-----------
-Evaluation metrics for 3D segmentation:
-- dice_score (F1)
-- jaccard_score (mIoU)
-- pixel_accuracy (PA)
-- mean_pixel_accuracy (MPA) [New]
-- hd95
-"""
-
 import torch
 import torch.nn.functional as F
 import numpy as np
@@ -16,94 +5,90 @@ from scipy.spatial.distance import directed_hausdorff
 from scipy import ndimage
 
 
-def get_one_hot(preds, num_classes):
-    return F.one_hot(preds.argmax(dim=1), num_classes).permute(0, 4, 1, 2, 3)
+def get_brats_regions(tensor_mask):
+    """
+    将标签 (0, 1, 2, 3) 转换为 BraTS 区域 (WT, TC, ET)。
+    假设标签: 0=背景, 1=坏死/非增强, 2=水肿, 3=增强肿瘤
+    WT (Whole Tumor) = 1 + 2 + 3
+    TC (Tumor Core)  = 1 + 3
+    ET (Enhancing)   = 3
+    """
+    wt = (tensor_mask > 0).float()
+    tc = ((tensor_mask == 1) | (tensor_mask == 3)).float()
+    et = (tensor_mask == 3).float()
+    return wt, tc, et
 
 
-def dice_score(preds, targets):
-    """Dice score (F1 Score)"""
-    num_classes = preds.shape[1]
-    pred_soft = F.softmax(preds, dim=1)
-    pred_label = torch.argmax(pred_soft, dim=1)
-    dice_per_class = []
+def compute_dice_single(pred, target):
+    """计算单个二值 mask 的 Dice"""
     eps = 1e-5
-    for c in range(num_classes):
-        p = (pred_label == c).float()
-        t = (targets == c).float()
-        inter = (p * t).sum()
-        union = p.sum() + t.sum()
-        dice = (2 * inter + eps) / (union + eps)
-        dice_per_class.append(dice.item())
-    return float(np.mean(dice_per_class))
+    inter = (pred * target).sum()
+    union = pred.sum() + target.sum()
+    return (2 * inter + eps) / (union + eps)
 
 
-def jaccard_score(preds, targets):
-    """Jaccard Coefficient (mIoU)"""
-    num_classes = preds.shape[1]
-    pred_soft = F.softmax(preds, dim=1)
-    pred_label = torch.argmax(pred_soft, dim=1)
-    iou_per_class = []
-    eps = 1e-5
-    for c in range(num_classes):
-        p = (pred_label == c).float()
-        t = (targets == c).float()
-        inter = (p * t).sum()
-        union = p.sum() + t.sum() - inter
-        iou = (inter + eps) / (union + eps)
-        iou_per_class.append(iou.item())
-    return float(np.mean(iou_per_class))
+def compute_hd95_single(pred, target):
+    """使用 Scipy 计算单个二值 mask 的 HD95"""
+    pred_np = pred.cpu().numpy().astype(bool)
+    target_np = target.cpu().numpy().astype(bool)
 
+    if not np.any(pred_np) or not np.any(target_np):
+        return 374.0  # 如果一方为空，给予最大惩罚
 
-def pixel_accuracy(preds, targets):
-    """Global Pixel Accuracy (PA)"""
-    pred_label = torch.argmax(preds, dim=1)
-    correct = (pred_label == targets).float().sum()
-    total = torch.numel(targets)
-    return float(correct / (total + 1e-8))
-
-
-def mean_pixel_accuracy(preds, targets):
-    """Mean Pixel Accuracy (MPA) per class"""
-    num_classes = preds.shape[1]
-    pred_label = torch.argmax(preds, dim=1)
-    acc_per_class = []
-    for c in range(num_classes):
-        t = (targets == c).float()
-        p = (pred_label == c).float()
-
-        total_c = t.sum()
-        if total_c == 0:
-            continue
-
-        correct_c = (p * t).sum()
-        acc = correct_c / total_c
-        acc_per_class.append(acc.item())
-
-    if len(acc_per_class) == 0:
+    # 如果完全相同，距离为0
+    if np.array_equal(pred_np, target_np):
         return 0.0
-    return float(np.mean(acc_per_class))
+
+    d_p_to_t = directed_hausdorff(pred_np, target_np)[0]
+    d_t_to_p = directed_hausdorff(target_np, pred_np)[0]
+    return max(d_p_to_t, d_t_to_p)
 
 
-def compute_hd95(preds, targets, num_classes=None):
-    if num_classes is None:
-        num_classes = preds.shape[1]
-    pred_label = torch.argmax(preds, dim=1).cpu().numpy()
-    target_label = targets.cpu().numpy()
-    hd95_per_class = []
-    for c in range(num_classes):
-        p = (pred_label == c)
-        t = (target_label == c)
-        if np.sum(p) == 0 or np.sum(t) == 0:
-            continue
-        p_border = p ^ ndimage.binary_erosion(p)
-        t_border = t ^ ndimage.binary_erosion(t)
-        p_points = np.argwhere(p_border)
-        t_points = np.argwhere(t_border)
-        if len(p_points) == 0 or len(t_points) == 0:
-            continue
-        d_p_to_t = directed_hausdorff(p_points, t_points)[0]
-        d_t_to_p = directed_hausdorff(t_points, p_points)[0]
-        hd95_per_class.append(max(d_p_to_t, d_t_to_p))
-    if len(hd95_per_class) == 0:
-        return 100.0
-    return float(np.mean(hd95_per_class))
+def calculate_brats_metrics(preds, targets):
+    """
+    计算 WT, TC, ET 的 Dice 和 HD95。
+    Args:
+        preds: (N, C, D, H, W) 模型输出的 logits
+        targets: (N, D, H, W) 真实标签 (0,1,2,3)
+    Returns:
+        dict: 包含各项指标的字典
+    """
+    pred_labels = torch.argmax(preds, dim=1)  # (N, D, H, W)
+
+    dice_scores = {"wt": [], "tc": [], "et": []}
+    hd95_scores = {"wt": [], "tc": [], "et": []}
+
+    batch_size = preds.shape[0]
+
+    for i in range(batch_size):
+        # 提取三个区域的 mask
+        p_wt, p_tc, p_et = get_brats_regions(pred_labels[i])
+        t_wt, t_tc, t_et = get_brats_regions(targets[i])
+
+        # 计算 Dice
+        dice_scores["wt"].append(compute_dice_single(p_wt, t_wt).item())
+        dice_scores["tc"].append(compute_dice_single(p_tc, t_tc).item())
+        dice_scores["et"].append(compute_dice_single(p_et, t_et).item())
+
+        # 计算 HD95 (注意：计算量较大，如果训练太慢可考虑只在验证时计算)
+        hd95_scores["wt"].append(compute_hd95_single(p_wt, t_wt))
+        hd95_scores["tc"].append(compute_hd95_single(p_tc, t_tc))
+        hd95_scores["et"].append(compute_hd95_single(p_et, t_et))
+
+    results = {
+        "dice_wt": np.mean(dice_scores["wt"]),
+        "dice_tc": np.mean(dice_scores["tc"]),
+        "dice_et": np.mean(dice_scores["et"]),
+        "dice_mean": np.mean(dice_scores["wt"] + dice_scores["tc"] + dice_scores["et"]),
+        "hd95_wt": np.mean(hd95_scores["wt"]),
+        "hd95_tc": np.mean(hd95_scores["tc"]),
+        "hd95_et": np.mean(hd95_scores["et"]),
+        "hd95_mean": np.mean(hd95_scores["wt"] + hd95_scores["tc"] + hd95_scores["et"])
+    }
+    return results
+
+
+# 兼容旧代码的简单接口
+def dice_score(preds, targets):
+    res = calculate_brats_metrics(preds, targets)
+    return res["dice_mean"]
