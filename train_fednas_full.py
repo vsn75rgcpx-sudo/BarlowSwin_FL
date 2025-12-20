@@ -302,7 +302,7 @@ def run_barlow_pretraining(data_root, train_ids, device):
 
 
 # ============================================================
-# STAGE 1: FedNAS Search (With Warmup)
+# STAGE 1: FedNAS Search (With Warmup & Early Stopping)
 # ============================================================
 def federated_search_stage(num_clients, datasets, device, in_channels, resolution):
     print("\n===== STAGE 1: FEDNAS SEARCH =====")
@@ -311,6 +311,10 @@ def federated_search_stage(num_clients, datasets, device, in_channels, resolutio
 
     # Initialize Server
     server = FederatedServer(model_fn, num_clients, device=device, alpha_lr=0.5)
+
+    # [FIX] Re-enable Early Stopping
+    # patience=10: Allow 10 rounds of no improvement before stopping
+    early_stop = EarlyStopping(patience=10, delta=0.005, mode='max')
 
     clients = [FederatedClient(cid=i, model_fn=model_fn, dataset=datasets[i],
                                device=device, batch_size=CONFIG["search_batch_size"],
@@ -323,20 +327,19 @@ def federated_search_stage(num_clients, datasets, device, in_channels, resolutio
     for rnd in range(CONFIG["search_rounds"]):
         print(f"\n--- Search Round {rnd + 1}/{CONFIG['search_rounds']} ---")
 
-        # [MODIFICATION] Warmup Logic: Freeze alpha for first 10 rounds
+        # --- 1. Warmup Logic ---
         if rnd < warmup_rounds:
-            print(f"  [Warmup] Round {rnd + 1}: Freezing Alpha, Training Weights Only (Focus on Supernet Convergence).")
-            # Try to zero out alpha learning rate if optimizer exists
+            print(f"  [Warmup] Round {rnd + 1}: Freezing Alpha, Training Weights Only.")
             if hasattr(server, 'alpha_optimizer'):
                 for param_group in server.alpha_optimizer.param_groups:
                     param_group['lr'] = 0.0
         elif rnd == warmup_rounds:
             print(f"  [Warmup End] Round {rnd + 1}: Unfreezing Alpha. Starting Architecture Search.")
-            # Restore learning rate
             if hasattr(server, 'alpha_optimizer'):
                 for param_group in server.alpha_optimizer.param_groups:
-                    param_group['lr'] = 0.5
+                    param_group['lr'] = 0.5  # Restore Alpha LR
 
+        # --- 2. Training ---
         global_weights = server.get_global_weights()
         global_alpha = server.global_alphas
         results, losses = {}, []
@@ -349,17 +352,22 @@ def federated_search_stage(num_clients, datasets, device, in_channels, resolutio
         server.federated_round(list(range(num_clients)), results)
 
         val_dice = np.mean([r.get("val_dice", 0) for r in results.values()])
-
-        if rnd < warmup_rounds:
-            print(f"  [Log] Val Dice: {val_dice:.4f} (Ignored during Warmup)")
-        else:
-            print(f"  [Log] Val Dice: {val_dice:.4f}")
-
         dice_history.append(val_dice)
 
         # Save Checkpoint
         ckpt_path = os.path.join(CHECKPOINT_DIR, f"fednas_round_{rnd + 1}.pth")
         server.save(ckpt_path)
+
+        # --- 3. Early Stopping Logic (Smart) ---
+        if rnd < warmup_rounds:
+            print(f"  [Log] Val Dice: {val_dice:.4f} (Warmup phase - EarlyStopping ignored)")
+        else:
+            print(f"  [Log] Val Dice: {val_dice:.4f}")
+            # Only start counting patience AFTER warmup is done
+            early_stop(val_dice)
+            if early_stop.early_stop:
+                print(f"  [!] Early stopping triggered at Round {rnd + 1}.")
+                break
 
     plt.figure()
     plt.plot(dice_history, label='Search Dice')
