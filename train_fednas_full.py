@@ -121,6 +121,8 @@ class BraTSDataset(Dataset):
         self.augment = augment
         self.suffixes = ['t1n', 't1c', 't2w', 't2f']
         self.seg_suffix = 'seg'
+        # [新增] 默认前景采样概率
+        self.foreground_prob = 0.66
 
     def __len__(self):
         return len(self.case_ids)
@@ -138,27 +140,39 @@ class BraTSDataset(Dataset):
         D, H, W = vol.shape[1:]
         tD, tH, tW = self.target_shape
 
-        if self.augment:
-            d_start = random.randint(0, max(0, D - tD))
-            h_start = random.randint(0, max(0, H - tH))
-            w_start = random.randint(0, max(0, W - tW))
-        else:
-            d_start = (D - tD) // 2;
-            h_start = (H - tH) // 2;
-            w_start = (W - tW) // 2
+        # === 核心修改：前景过采样 ===
+        # [修改] 使用 self.foreground_prob 替代写死的 0.66
+        # 只有在开启 augment 且 mask 中确实存在肿瘤时才执行
+        if self.augment and (seg > 0).sum() > 0 and random.random() < self.foreground_prob:
+            # 强制包含肿瘤
+            candidate_indices = np.argwhere(seg > 0)
+            center_idx = random.randint(0, len(candidate_indices) - 1)
+            center_d, center_h, center_w = candidate_indices[center_idx]
 
-        d_start = max(0, d_start);
-        h_start = max(0, h_start);
-        w_start = max(0, w_start)
-        d_end = min(D, d_start + tD);
-        h_end = min(H, h_start + tH);
+            d_start = int(np.clip(center_d - tD // 2, 0, max(0, D - tD)))
+            h_start = int(np.clip(center_h - tH // 2, 0, max(0, H - tH)))
+            w_start = int(np.clip(center_w - tW // 2, 0, max(0, W - tW)))
+        else:
+            # 随机裁剪 / 中心裁剪
+            if self.augment:
+                d_start = random.randint(0, max(0, D - tD))
+                h_start = random.randint(0, max(0, H - tH))
+                w_start = random.randint(0, max(0, W - tW))
+            else:
+                d_start = (D - tD) // 2
+                h_start = (H - tH) // 2
+                w_start = (W - tW) // 2
+
+        d_end = min(D, d_start + tD)
+        h_end = min(H, h_start + tH)
         w_end = min(W, w_start + tW)
 
         vol_crop = vol[:, d_start:d_end, h_start:h_end, w_start:w_end]
         seg_crop = seg[d_start:d_end, h_start:h_end, w_start:w_end]
 
-        pad_d = tD - vol_crop.shape[1];
-        pad_h = tH - vol_crop.shape[2];
+        # Padding
+        pad_d = tD - vol_crop.shape[1]
+        pad_h = tH - vol_crop.shape[2]
         pad_w = tW - vol_crop.shape[3]
         if pad_d > 0 or pad_h > 0 or pad_w > 0:
             vol_crop = np.pad(vol_crop, ((0, 0), (0, pad_d), (0, pad_h), (0, pad_w)), mode='constant')
@@ -405,19 +419,18 @@ def average_model_weights(top_k_checkpoints, device):
 
 
 def federated_retrain(num_clients, datasets, arch_json, device, in_channels, resolution):
-    print("\n===== STAGE 3: RETRAINING =====")
+    print("\n===== STAGE 3: RETRAINING (Optimized) =====")
 
     model_fn = get_model_factory(in_channels, resolution, arch_json=arch_json, mode="fixed")
     server = FederatedServer(model_fn, num_clients, device=device)
 
-    # Warm-start from previous round (optional)
-    if os.path.exists("fixed_model_initial.pth"):
-        try:
-            ckpt = torch.load("fixed_model_initial.pth", map_location=device)
-            server.global_model.load_state_dict(ckpt, strict=False)
-            print("[Retrain] Loaded warm-start weights.")
-        except:
-            pass
+    # Initial config
+    initial_lr = 1e-4
+    end_lr = 1e-5  # 第 100 轮目标
+
+    # Boundary weight schedule
+    start_bound = 0.01
+    end_bound = 0.5
 
     clients = []
     for i in range(num_clients):
@@ -425,8 +438,70 @@ def federated_retrain(num_clients, datasets, arch_json, device, in_channels, res
                             device=device, batch_size=CONFIG["retrain_batch_size"],
                             num_workers=CONFIG["num_workers"],
                             epochs=CONFIG["retrain_local_epochs"],
-                            lr=CONFIG["retrain_lr"])
+                            lr=initial_lr)  # Initial LR
         clients.append(c)
+
+    top_k_models = []
+
+    for rnd in range(CONFIG["retrain_rounds"]):
+        print(f"\n--- Retrain Round {rnd + 1}/{CONFIG['retrain_rounds']} ---")
+
+        # 1. 计算当前轮次的 LR (指数衰减)
+        # progress 0.0 -> 1.0
+        progress = rnd / CONFIG["retrain_rounds"]
+        current_lr = initial_lr * ((end_lr / initial_lr) ** progress)
+
+        # 2. [新增] 动态调整前景采样率 (Sampling Annealing)
+        if rnd < 20:
+            current_prob = 0.66
+        elif rnd < 80:
+            # 20到80轮之间，从 0.66 线性降到 0.1
+            ratio = (rnd - 20) / (80 - 20)
+            current_prob = 0.66 - ratio * (0.66 - 0.1)
+        else:
+            current_prob = 0.1  # 后期保持低采样率，模拟真实分布
+
+        # [关键] 将新的概率应用到所有 Client 的 Dataset 中
+        for c in clients:
+            # 这里的 dataset 属性就是我们传入的 BraTSDataset 实例
+            # 注意：如果 client 内部用了 random_split，train_ds 是 Subset
+            # Subset.dataset 指向原始 dataset，所以修改原始 dataset 即可生效
+            c.dataset.foreground_prob = current_prob
+
+        # 3. 计算当前轮次的 Boundary Weight (线性增加)
+        # 前 20% 轮次保持 0.01，后面逐渐增加到 0.5
+        if progress < 0.2:
+            current_bound = start_bound
+        else:
+            # 归一化剩余进度
+            p_bound = (progress - 0.2) / 0.8
+            current_bound = start_bound + p_bound * (end_bound - start_bound)
+
+        # Loss 配置
+        loss_config = {
+            "use_focal": True,  # 开启 Focal Loss
+            "weight_boundary": current_bound
+        }
+
+        print(f"  [Config] LR: {current_lr:.2e} | BoundaryW: {current_bound:.3f} | Focal: On")
+
+        global_weights = server.get_global_weights()
+        results, losses = {}, []
+
+        for cid in range(num_clients):
+            # 将动态参数传入 train
+            res = clients[cid].train(global_weights, [], current_lr=current_lr, loss_config=loss_config)
+            results[cid] = res
+            if res.get("loss"): losses.append(res["loss"])
+
+        # Aggregate
+        weights_list = [results[c]["weights"] for c in results]
+        sizes = [results[c]["size"] for c in results]
+        new_state = server.aggregate_params(weights_list, sizes)
+        server.set_global_weights(new_state)
+
+        val_dice = np.mean([r.get("val_dice", 0) for r in results.values()])
+        print(f"  [Log] Val Dice: {val_dice:.4f}")
 
     # [MODIFICATION] Top-K List
     # Stores tuples: {'dice': float, 'path': str}
@@ -504,15 +579,14 @@ def federated_retrain(num_clients, datasets, arch_json, device, in_channels, res
 # STAGE 4: Final Test
 # ============================================================
 def final_test_phase(test_dataset, arch_json, device, in_channels, resolution, best_model_path=None):
-    print("\n===== STAGE 4: FINAL TEST =====")
+    print("\n===== STAGE 4: FINAL TEST (Detailed Metrics) =====")
 
-    # If not provided, try to find the averaged model first
     if best_model_path is None:
         best_model_path = os.path.join(CHECKPOINT_DIR, "retrain_averaged_model.pth")
 
     if not os.path.exists(best_model_path):
         print(f"[!] {best_model_path} not found. Trying best single model...")
-        best_model_path = os.path.join(CHECKPOINT_DIR, "retrain_best_model.pth")  # Fallback
+        best_model_path = os.path.join(CHECKPOINT_DIR, "retrain_best_model.pth")
 
     print(f"[Test] Loading model from: {best_model_path}")
     model_fn = get_model_factory(in_channels, resolution, arch_json=arch_json, mode="fixed")
@@ -524,54 +598,103 @@ def final_test_phase(test_dataset, arch_json, device, in_channels, resolution, b
     model.eval()
 
     test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=0)
-    metrics_log = {"CaseID": [], "Dice": [], "mIoU": [], "PA": [], "MPA": []}
+
+    # 初始化日志字典
+    metrics_log = {
+        "CaseID": [],
+        "Dice_Mean": [], "Dice_WT": [], "Dice_TC": [], "Dice_ET": [],
+        "HD95_Mean": [], "HD95_WT": [], "HD95_TC": [], "HD95_ET": [],
+        "mIoU": [], "PA": [], "MPA": []
+    }
+
+    print("  [Info] Post-processing: Removing connected components < 200 voxels")
+    print("  [Info] Calculating detailed metrics (WT, TC, ET, HD95)... This may take a while.")
 
     with torch.no_grad():
         for i, (inputs, targets) in enumerate(test_loader):
             inputs, targets = inputs.to(device), targets.to(device)
-            outputs = model(inputs)
+            outputs = model(inputs)  # logits
 
-            d = metrics.dice_score(outputs, targets)
+            # 1. 获取初步预测 Mask
+            pred_mask = torch.argmax(outputs, dim=1).cpu().numpy()[0]
+            target_mask = targets.cpu().numpy()[0]
+
+            # 2. 后处理 (移除小连通域)
+            pred_mask_clean = metrics.postprocess_remove_small_objects(pred_mask, min_size=200)
+
+            # 3. 计算详细指标 (使用新函数)
+            # 注意：传入清洗后的 Mask 和 Ground Truth
+            res = metrics.calculate_metrics_from_mask(pred_mask_clean, target_mask)
+
+            # 4. 计算辅助指标 (mIoU, PA)
+            # 需要构造一个 fake logits 传给这些函数，或者你也可以改造这些函数
+            # 这里简单起见，我们直接计算，不经过后处理的 mIoU (或者你可以构造 fake logits)
             miou = metrics.jaccard_score(outputs, targets)
             pa = metrics.pixel_accuracy(outputs, targets)
             mpa = metrics.mean_pixel_accuracy(outputs, targets)
 
+            # 5. 记录日志
             case_id = test_dataset.case_ids[i]
             metrics_log["CaseID"].append(case_id)
-            metrics_log["Dice"].append(d)
+
+            # 填入详细 Dice 和 HD95
+            for k, v in res.items():
+                metrics_log[k].append(v)
+
             metrics_log["mIoU"].append(miou)
             metrics_log["PA"].append(pa)
             metrics_log["MPA"].append(mpa)
 
+            # 打印进度 (每 5 个样本打印一次)
+            if (i + 1) % 5 == 0:
+                print(
+                    f"    [{i + 1}/{len(test_dataset)}] Case: {case_id} | Dice Mean: {res['Dice_Mean']:.4f} | HD95 Mean: {res['HD95_Mean']:.2f}")
+
+    # 保存 CSV
     df = pd.DataFrame(metrics_log)
-    csv_path = os.path.join(RESULT_DIR, "final_test_metrics.csv")
+    csv_path = os.path.join(RESULT_DIR, "final_test_metrics_detailed.csv")
     df.to_csv(csv_path, index=False)
 
-    # [MODIFICATION] Explicitly Print Metrics to Console
-    print("\n" + "=" * 30)
-    print("       FINAL TEST RESULTS       ")
-    print("=" * 30)
-    print(f"Mean Dice : {df['Dice'].mean():.4f}")
-    print(f"Mean mIoU : {df['mIoU'].mean():.4f}")
-    print(f"Mean PA   : {df['PA'].mean():.4f}")
-    print(f"Mean MPA  : {df['MPA'].mean():.4f}")
-    print("=" * 30 + "\n")
+    # 打印最终统计
+    print("\n" + "=" * 40)
+    print("       FINAL TEST RESULTS (Detailed)       ")
+    print("=" * 40)
+    print(f"Dice Mean : {df['Dice_Mean'].mean():.4f}")
+    print(f"   - WT   : {df['Dice_WT'].mean():.4f}")
+    print(f"   - TC   : {df['Dice_TC'].mean():.4f}")
+    print(f"   - ET   : {df['Dice_ET'].mean():.4f}")
+    print("-" * 40)
+    print(f"HD95 Mean : {df['HD95_Mean'].mean():.2f}")
+    print(f"   - WT   : {df['HD95_WT'].mean():.2f}")
+    print(f"   - TC   : {df['HD95_TC'].mean():.2f}")
+    print(f"   - ET   : {df['HD95_ET'].mean():.2f}")
+    print("=" * 40 + "\n")
 
-    # Generate Plots
-    plt.figure(figsize=(14, 6))
-    plt.subplot(1, 2, 1)
-    sns.boxplot(data=df[['Dice', 'mIoU']])
-    plt.title("Dice & mIoU")
+    # 绘图 (箱线图)
+    plt.figure(figsize=(18, 6))
+
+    # 子图1: Dice 分布
+    plt.subplot(1, 3, 1)
+    sns.boxplot(data=df[['Dice_WT', 'Dice_TC', 'Dice_ET', 'Dice_Mean']])
+    plt.title("Dice Score Distribution")
+    plt.ylim(0, 1)
     plt.grid(True, alpha=0.3)
 
-    plt.subplot(1, 2, 2)
-    sns.boxplot(data=df[['PA', 'MPA']])
-    plt.title("Pixel Accuracy")
+    # 子图2: HD95 分布
+    plt.subplot(1, 3, 2)
+    sns.boxplot(data=df[['HD95_WT', 'HD95_TC', 'HD95_ET', 'HD95_Mean']])
+    plt.title("HD95 Distribution (Lower is better)")
     plt.grid(True, alpha=0.3)
 
-    plt.savefig(os.path.join(RESULT_DIR, "final_metrics_boxplot.png"))
+    # 子图3: 其他指标
+    plt.subplot(1, 3, 3)
+    sns.boxplot(data=df[['mIoU', 'PA', 'MPA']])
+    plt.title("Auxiliary Metrics")
+    plt.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(RESULT_DIR, "final_metrics_detailed_boxplot.png"))
     print(f"[Test] Detailed CSV saved to {csv_path}")
-
 
 # ============================================================
 # Main Execution
