@@ -8,3 +8,4 @@ __pycache__/
 dataset/
 datasets/
 .DS_Store
+my_experiment_results
