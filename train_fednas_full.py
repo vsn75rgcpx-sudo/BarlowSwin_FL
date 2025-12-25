@@ -241,7 +241,7 @@ def get_model_factory(in_channels, resolution, num_classes=4, init_barlow_path=N
 
     return create_nas if mode == "nas" else create_fixed
 
-
+#
 # ============================================================
 # STAGE 0: Barlow Twins Pretraining
 # ============================================================
