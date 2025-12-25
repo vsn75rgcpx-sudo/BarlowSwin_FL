@@ -419,107 +419,85 @@ def average_model_weights(top_k_checkpoints, device):
 
 
 def federated_retrain(num_clients, datasets, arch_json, device, in_channels, resolution):
-    print("\n===== STAGE 3: RETRAINING (Optimized) =====")
+    print("\n===== STAGE 3: RETRAINING (Optimized & Merged) =====")
 
     model_fn = get_model_factory(in_channels, resolution, arch_json=arch_json, mode="fixed")
     server = FederatedServer(model_fn, num_clients, device=device)
 
-    # Initial config
+    # --- 参数设置 ---
     initial_lr = 1e-4
-    end_lr = 1e-5  # 第 100 轮目标
-
-    # Boundary weight schedule
+    end_lr = 1e-5  # 第 100 轮的目标学习率
     start_bound = 0.01
-    end_bound = 0.5
+    end_bound = 0.5  # 边界损失权重上限
 
+    # 初始化客户端
     clients = []
     for i in range(num_clients):
         c = FederatedClient(cid=i, model_fn=model_fn, dataset=datasets[i],
                             device=device, batch_size=CONFIG["retrain_batch_size"],
                             num_workers=CONFIG["num_workers"],
                             epochs=CONFIG["retrain_local_epochs"],
-                            lr=initial_lr)  # Initial LR
+                            lr=initial_lr)
         clients.append(c)
 
+    # --- 监控变量初始化 ---
     top_k_models = []
+    start_monitoring_round = CONFIG["retrain_rounds"] // 2  # 50轮后开始监控
+    dice_history = []
 
+    # =========================================================================
+    #  唯一的训练循环 (合并了原先 446行 和 512行 的逻辑)
+    # =========================================================================
     for rnd in range(CONFIG["retrain_rounds"]):
         print(f"\n--- Retrain Round {rnd + 1}/{CONFIG['retrain_rounds']} ---")
 
-        # 1. 计算当前轮次的 LR (指数衰减)
-        # progress 0.0 -> 1.0
+        # ----------------------
+        # 1. 动态参数计算 (原 446行循环的逻辑)
+        # ----------------------
         progress = rnd / CONFIG["retrain_rounds"]
+
+        # 学习率指数衰减
         current_lr = initial_lr * ((end_lr / initial_lr) ** progress)
 
-        # 2. [新增] 动态调整前景采样率 (Sampling Annealing)
+        # 采样率退火 (Sampling Annealing)
         if rnd < 20:
             current_prob = 0.66
         elif rnd < 80:
-            # 20到80轮之间，从 0.66 线性降到 0.1
             ratio = (rnd - 20) / (80 - 20)
             current_prob = 0.66 - ratio * (0.66 - 0.1)
         else:
-            current_prob = 0.1  # 后期保持低采样率，模拟真实分布
+            current_prob = 0.1
 
-        # [关键] 将新的概率应用到所有 Client 的 Dataset 中
+        # 应用采样率到所有客户端
         for c in clients:
-            # 这里的 dataset 属性就是我们传入的 BraTSDataset 实例
-            # 注意：如果 client 内部用了 random_split，train_ds 是 Subset
-            # Subset.dataset 指向原始 dataset，所以修改原始 dataset 即可生效
             c.dataset.foreground_prob = current_prob
 
-        # 3. 计算当前轮次的 Boundary Weight (线性增加)
-        # 前 20% 轮次保持 0.01，后面逐渐增加到 0.5
+        # 边界权重线性增加
         if progress < 0.2:
             current_bound = start_bound
         else:
-            # 归一化剩余进度
             p_bound = (progress - 0.2) / 0.8
             current_bound = start_bound + p_bound * (end_bound - start_bound)
 
-        # Loss 配置
         loss_config = {
-            "use_focal": True,  # 开启 Focal Loss
+            "use_focal": True,
             "weight_boundary": current_bound
         }
 
-        print(f"  [Config] LR: {current_lr:.2e} | BoundaryW: {current_bound:.3f} | Focal: On")
+        print(f"  [Config] LR: {current_lr:.2e} | BoundaryW: {current_bound:.3f} | Sampling: {current_prob:.2f}")
 
+        # ----------------------
+        # 2. 训练与聚合
+        # ----------------------
         global_weights = server.get_global_weights()
         results, losses = {}, []
 
         for cid in range(num_clients):
-            # 将动态参数传入 train
+            # [关键] 传入动态计算的 lr 和 loss_config
             res = clients[cid].train(global_weights, [], current_lr=current_lr, loss_config=loss_config)
             results[cid] = res
             if res.get("loss"): losses.append(res["loss"])
 
-        # Aggregate
-        weights_list = [results[c]["weights"] for c in results]
-        sizes = [results[c]["size"] for c in results]
-        new_state = server.aggregate_params(weights_list, sizes)
-        server.set_global_weights(new_state)
-
-        val_dice = np.mean([r.get("val_dice", 0) for r in results.values()])
-        print(f"  [Log] Val Dice: {val_dice:.4f}")
-
-    # [MODIFICATION] Top-K List
-    # Stores tuples: {'dice': float, 'path': str}
-    top_k_models = []
-    start_monitoring_round = CONFIG["retrain_rounds"] // 2  # Start monitoring after 50%
-    dice_history = []
-
-    for rnd in range(CONFIG["retrain_rounds"]):
-        print(f"\n--- Retrain Round {rnd + 1}/{CONFIG['retrain_rounds']} ---")
-        global_weights = server.get_global_weights()
-        results, losses = {}, []
-
-        for cid in range(num_clients):
-            res = clients[cid].train(global_weights, [])
-            results[cid] = res
-            if res.get("loss"): losses.append(res["loss"])
-
-        # Aggregate
         weights_list = [results[c]["weights"] for c in results]
         sizes = [results[c]["size"] for c in results]
         new_state = server.aggregate_params(weights_list, sizes)
@@ -529,51 +507,48 @@ def federated_retrain(num_clients, datasets, arch_json, device, in_channels, res
         dice_history.append(val_dice)
         print(f"  [Log] Val Dice: {val_dice:.4f}")
 
-        # [MODIFICATION] Custom Saving Logic
-        # Always save current round for resumption
+        # ----------------------
+        # 3. 保存与监控 (原 512行循环的逻辑)
+        # ----------------------
+        # 保存每一轮的 Checkpoint
         current_ckpt_path = os.path.join(CHECKPOINT_DIR, f"retrain_round_{rnd + 1}.pth")
         server.save(current_ckpt_path)
 
-        # Only care about best models after 50% rounds
+        # Top-K 监控
         if rnd >= start_monitoring_round:
             print(f"  [Monitor] Analyzing for Top-{CONFIG['retrain_top_k']} candidates...")
-
-            # Add current to list
             top_k_models.append({'dice': val_dice, 'path': current_ckpt_path})
 
-            # Sort by dice descending
+            # 按 Dice 降序排列
             top_k_models.sort(key=lambda x: x['dice'], reverse=True)
 
-            # Keep only Top K
+            # 保持 Top K，移除多余的
             if len(top_k_models) > CONFIG["retrain_top_k"]:
-                # Remove the one that fell off the list (optional: delete file to save space)
                 removed = top_k_models.pop()
-                # os.remove(removed['path']) # Uncomment if disk space is tight
+                # 显式删除不再需要的模型文件以节省空间（可选）
+                # if os.path.exists(removed['path']): os.remove(removed['path'])
 
             print(f"  [Monitor] Current Top Dice values: {[round(m['dice'], 4) for m in top_k_models]}")
         else:
             print("  [Monitor] Warmup phase (first 50%), not tracking top models yet.")
 
+    # --- 循环结束后的处理 ---
     plt.figure()
     plt.plot(dice_history, label='Retrain Dice')
     plt.savefig(os.path.join(RESULT_DIR, 'retrain_dice.png'))
     plt.close()
 
-    # [MODIFICATION] Final Averaging
+    # 导出平均模型
     if len(top_k_models) > 0:
         print(f"\n[Final] Averaging Top-{len(top_k_models)} models...")
         averaged_weights = average_model_weights(top_k_models, device)
-
-        # Save Averaged Model
         final_path = os.path.join(CHECKPOINT_DIR, "retrain_averaged_model.pth")
         server.global_model.load_state_dict(averaged_weights)
         server.save(final_path)
         print(f"[Final] Averaged model saved to: {final_path}")
         return final_path
     else:
-        # Fallback if rounds < start_monitoring
         return os.path.join(CHECKPOINT_DIR, f"retrain_round_{CONFIG['retrain_rounds']}.pth")
-
 
 # ============================================================
 # STAGE 4: Final Test
