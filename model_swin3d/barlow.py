@@ -21,22 +21,18 @@ import scipy.ndimage as ndi
 # Projector MLP for Barlow Twins
 # -------------------------
 class BarlowProjector(nn.Module):
-    """
-    Projector for Barlow Twins.
-    Structure: Linear -> BN -> ReLU -> Linear
-
-    [Modification]: Switched from LayerNorm to BatchNorm1d.
-    Requires batch_size > 1.
-    """
-
     def __init__(self, in_dim: int, hidden_dim: int = 512, out_dim: int = 1024):
         super().__init__()
         self.net = nn.Sequential(
+            # 第一层
             nn.Linear(in_dim, hidden_dim, bias=False),
-            # 使用 BatchNorm1d，更符合 Barlow Twins 原理
-            # 注意：这要求 Batch Size 必须大于 1
             nn.BatchNorm1d(hidden_dim),
             nn.ReLU(inplace=True),
+            # 第二层 (新增)
+            nn.Linear(hidden_dim, hidden_dim, bias=False),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(inplace=True),
+            # 第三层 (输出层，通常不加 ReLU，原论文也不加 BN，但加上有助于训练稳定性)
             nn.Linear(hidden_dim, out_dim, bias=False),
         )
 

@@ -56,7 +56,7 @@ CONFIG = {
     # Stage 0: Barlow Twins
     "barlow_rounds": 20,
     "barlow_local_epochs": 5,
-    "barlow_batch_size": 16,
+    "barlow_batch_size": 4,
 
     # Stage 1: Search (NAS)
     "search_rounds": 50,
@@ -428,7 +428,7 @@ def federated_retrain(num_clients, datasets, arch_json, device, in_channels, res
     initial_lr = 1e-4
     end_lr = 1e-5  # 第 100 轮的目标学习率
     start_bound = 0.01
-    end_bound = 0.5  # 边界损失权重上限
+    end_bound = 0.1  # 边界损失权重上限
 
     # 初始化客户端
     clients = []
