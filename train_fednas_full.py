@@ -114,13 +114,14 @@ class DataParallelPassthrough(torch.nn.DataParallel):
 # 1. Dataset Class
 # ============================================================
 class BraTSDataset(Dataset):
-    def __init__(self, root_dir, case_ids, target_shape=(96, 96, 96), augment=False):
+    def __init__(self, root_dir, case_ids, target_shape=(96, 96, 96), augment=False,test_mode=False):
         self.root_dir = root_dir
         self.case_ids = case_ids
         self.target_shape = target_shape
         self.augment = augment
         self.suffixes = ['t1n', 't1c', 't2w', 't2f']
         self.seg_suffix = 'seg'
+        self.test_mode = test_mode  # [新增]
         # [新增] 默认前景采样概率
         self.foreground_prob = 0.66
 
@@ -137,6 +138,9 @@ class BraTSDataset(Dataset):
         return vol
 
     def crop_or_pad(self, vol, seg):
+        # [新增] 如果是测试模式，直接返回全图，不裁剪
+        if self.test_mode:
+            return torch.from_numpy(vol).float(), torch.from_numpy(seg).long()
         D, H, W = vol.shape[1:]
         tD, tH, tW = self.target_shape
 
@@ -588,7 +592,8 @@ def final_test_phase(test_dataset, arch_json, device, in_channels, resolution, b
     with torch.no_grad():
         for i, (inputs, targets) in enumerate(test_loader):
             inputs, targets = inputs.to(device), targets.to(device)
-            outputs = model(inputs)  # logits
+            # 新代码: 使用滑动窗口推理，避免 OOM 且支持全图
+            outputs = metrics.sliding_window_inference(inputs, model, window_size=(96, 96, 96), num_classes=4,overlap=0.5)
 
             # 1. 获取初步预测 Mask
             pred_mask = torch.argmax(outputs, dim=1).cpu().numpy()[0]
@@ -715,7 +720,7 @@ def main():
                                         resolution)
 
     # Stage 4: Test
-    test_ds = BraTSDataset(data_root, test_ids, augment=False)
+    test_ds = BraTSDataset(data_root, test_ids, augment=False,test_mode=True)
     final_test_phase(test_ds, json_path, CONFIG["device"], in_channels, resolution, best_model_path)
 
 
