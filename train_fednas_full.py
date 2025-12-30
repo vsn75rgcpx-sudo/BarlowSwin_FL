@@ -138,26 +138,36 @@ class BraTSDataset(Dataset):
         return vol
 
     def crop_or_pad(self, vol, seg):
-        # [新增] 如果是测试模式，直接返回全图，不裁剪
         if self.test_mode:
             return torch.from_numpy(vol).float(), torch.from_numpy(seg).long()
+
         D, H, W = vol.shape[1:]
         tD, tH, tW = self.target_shape
 
-        # === 核心修改：前景过采样 ===
-        # [修改] 使用 self.foreground_prob 替代写死的 0.66
-        # 只有在开启 augment 且 mask 中确实存在肿瘤时才执行
-        if self.augment and (seg > 0).sum() > 0 and random.random() < self.foreground_prob:
-            # 强制包含肿瘤
-            candidate_indices = np.argwhere(seg > 0)
-            center_idx = random.randint(0, len(candidate_indices) - 1)
-            center_d, center_h, center_w = candidate_indices[center_idx]
+        # === 升级版：难样本挖掘 (OHEM) 采样 ===
+        # 逻辑：如果存在 TC(1) 或 ET(3)，我们有 70% 的概率强制采样它们的中心
+        # 这样模型看到核心区域的次数会大大增加
 
-            d_start = int(np.clip(center_d - tD // 2, 0, max(0, D - tD)))
-            h_start = int(np.clip(center_h - tH // 2, 0, max(0, H - tH)))
-            w_start = int(np.clip(center_w - tW // 2, 0, max(0, W - tW)))
+        if self.augment and (seg > 0).sum() > 0 and random.random() < self.foreground_prob:
+            # 查找特定区域的坐标
+            # 优先找 ET (3) 和 TC (1)
+            target_indices = np.argwhere((seg == 3) | (seg == 1))
+
+            # 如果没有 ET/TC，再退化到找任意肿瘤 (WT)
+            if len(target_indices) == 0:
+                target_indices = np.argwhere(seg > 0)
+
+            # 随机选一个中心点
+            center_idx = random.randint(0, len(target_indices) - 1)
+            center_d, center_h, center_w = target_indices[center_idx]
+
+            # 计算左上角坐标 (加了一点随机扰动，避免每次都在正中心)
+            d_start = int(np.clip(center_d - tD // 2 + random.randint(-10, 10), 0, max(0, D - tD)))
+            h_start = int(np.clip(center_h - tH // 2 + random.randint(-10, 10), 0, max(0, H - tH)))
+            w_start = int(np.clip(center_w - tW // 2 + random.randint(-10, 10), 0, max(0, W - tW)))
+
         else:
-            # 随机裁剪 / 中心裁剪
+            # 常规随机裁剪
             if self.augment:
                 d_start = random.randint(0, max(0, D - tD))
                 h_start = random.randint(0, max(0, H - tH))
@@ -167,17 +177,23 @@ class BraTSDataset(Dataset):
                 h_start = (H - tH) // 2
                 w_start = (W - tW) // 2
 
-        d_end = min(D, d_start + tD)
-        h_end = min(H, h_start + tH)
-        w_end = min(W, w_start + tW)
+        # 确保不越界
+        d_start = max(0, min(d_start, D - tD))
+        h_start = max(0, min(h_start, H - tH))
+        w_start = max(0, min(w_start, W - tW))
+
+        d_end = d_start + tD
+        h_end = h_start + tH
+        w_end = w_start + tW
 
         vol_crop = vol[:, d_start:d_end, h_start:h_end, w_start:w_end]
         seg_crop = seg[d_start:d_end, h_start:h_end, w_start:w_end]
 
-        # Padding
+        # Padding (以防原始图像比 Patch 小)
         pad_d = tD - vol_crop.shape[1]
         pad_h = tH - vol_crop.shape[2]
         pad_w = tW - vol_crop.shape[3]
+
         if pad_d > 0 or pad_h > 0 or pad_w > 0:
             vol_crop = np.pad(vol_crop, ((0, 0), (0, pad_d), (0, pad_h), (0, pad_w)), mode='constant')
             seg_crop = np.pad(seg_crop, ((0, pad_d), (0, pad_h), (0, pad_w)), mode='constant')
@@ -599,12 +615,11 @@ def final_test_phase(test_dataset, arch_json, device, in_channels, resolution, b
             pred_mask = torch.argmax(outputs, dim=1).cpu().numpy()[0]
             target_mask = targets.cpu().numpy()[0]
 
-            # 2. 后处理 (移除小连通域)
-            pred_mask_clean = metrics.postprocess_remove_small_objects(pred_mask, min_size=200)
+            # 2. 后处理 (已集成在 metrics 内部，此处直接注释掉或删除)
+            # pred_mask_clean = metrics.postprocess_remove_small_objects(pred_mask, min_size=200)
 
-            # 3. 计算详细指标 (使用新函数)
-            # 注意：传入清洗后的 Mask 和 Ground Truth
-            res = metrics.calculate_metrics_from_mask(pred_mask_clean, target_mask)
+            # 3. 计算详细指标 (直接传入 pred_mask，metrics 内部会自动调用 postprocess_hierarchical)
+            res = metrics.calculate_metrics_from_mask(pred_mask, target_mask)
 
             # 4. 计算辅助指标 (mIoU, PA)
             # 需要构造一个 fake logits 传给这些函数，或者你也可以改造这些函数
