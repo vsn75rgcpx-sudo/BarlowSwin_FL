@@ -44,7 +44,7 @@ def run_test():
     # =====================================================
     # [核心修正 2] 强制指定模型分辨率为 (96, 96, 96)
     # 这一步至关重要！因为权重是在 96x96x96 的模型上训练的。
-    # 如果用 full_resolution (240x240x155) 去初始化模型，加载权重时会报错 (Shape Mismatch)。
+    # 这里的 resolution 指的是“滑动窗口的大小”，而不是“整张图的大小”。
     # 滑动窗口机制会负责把 240 的大图切成 96 的块喂给这个模型。
     # =====================================================
     model_resolution = (96, 96, 96)
@@ -63,14 +63,17 @@ def run_test():
     print(f"[Test Only] Using Architecture: {json_path}")
     print(f"[Test Only] Using Weights: {model_to_load}")
     print(f"[Test Only] Inference Mode: Full Volume Sliding Window (Window Size: {model_resolution})")
+    inference_weights = [1.0, 1.2, 1.0, 1.2]
 
+    print(f"[Test] Inference Weights: {inference_weights}")
     # 4. 运行测试
+    # final_test_phase 内部会调用 metrics.sliding_window_inference
     final_test_phase(
         test_dataset=test_ds,
         arch_json=json_path,
         device=CONFIG["device"],
         in_channels=in_channels,
-        resolution=model_resolution,  # 传入强制的 96x96x96 分辨率
+        resolution=model_resolution,  # 传入强制的 96x96x96 分辨率 (作为窗口大小)
         best_model_path=model_to_load
     )
 

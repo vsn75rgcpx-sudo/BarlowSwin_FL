@@ -52,94 +52,99 @@ def compute_hd95_single(pred, target):
 # ==========================================
 # 2. 核心后处理：层级约束 (Hierarchical)
 # ==========================================
-def postprocess_hierarchical(pred_mask, min_size=200):
+def postprocess_hierarchical(pred_mask, min_size_wt=50, min_size_tc=30, min_size_et=10):
     """
-    层级后处理 (带 Safety Net 版本)
-
-    改进点：
-    如果清洗操作导致某种类别(TC/ET)完全消失，说明清洗过头了（通常是因为WT预测错了导致误杀内部）。
-    此时触发 Safety Net，回退该类别的清洗操作，避免 HD95=374。
+    层级后处理 (修复 HD95 版)
+    策略:
+    1. WT (Whole Tumor): 严格只保留最大连通域 (解决 HD95 飙升问题)。
+    2. TC (Tumor Core): 严格只保留最大连通域，且必须在 WT 内。
+    3. ET (Enhancing): 允许存在多个小块(如多发强化)，但极小的噪点退化为 TC。
     """
     result = np.copy(pred_mask)
 
-    # === 0. 备份原始各通道状态，用于 Safety Check ===
-    # 检查原始预测里有没有 TC 和 ET
+    # 0. 备份原始状态用于 Safety Net
     orig_has_tc = np.any((pred_mask == 1) | (pred_mask == 3))
-    orig_has_et = np.any(pred_mask == 3)
 
-    # === Step 1: 清洗 WT (Whole Tumor) ===
+    # === Step 1: WT (Whole Tumor) 处理 ===
     wt_mask = (result > 0)
-    if not np.any(wt_mask):
-        return result  # 原本就是空的，没办法
-
-    # 保留 WT 最大连通域
-    labeled_array, num_features = ndimage.label(wt_mask)
-    if num_features > 1:
+    if np.any(wt_mask):
+        labeled_array, num_features = ndimage.label(wt_mask)
         sizes = ndimage.sum(wt_mask, labeled_array, range(1, num_features + 1))
-        max_label = np.argmax(sizes) + 1
 
-        # 临时变量存储清洗后的 WT
-        wt_keep_mask = (labeled_array == max_label)
+        # [核心修正] 只保留【最大】的 WT 连通域
+        # 除非最大的那个都小于 min_size_wt (极罕见)，否则只取最大
+        if num_features > 0:
+            max_idx = np.argmax(sizes) + 1
+            max_size = sizes[max_idx - 1]
 
-        # 暂时应用清洗
-        result_step1 = np.copy(result)
-        result_step1[~wt_keep_mask] = 0
+            if max_size < min_size_wt:
+                # 如果最大的都认为是噪点，那就全删了 (但在 Safety Net 可能会救回来)
+                wt_keep_mask = np.zeros_like(wt_mask, dtype=bool)
+            else:
+                wt_keep_mask = (labeled_array == max_idx)
 
-        # [Safety Check 1] 检查：清洗 WT 是否导致 TC 全部丢失？
-        # 如果原始有 TC，但清洗 WT 后 TC 没了，说明这个"最大 WT"可能是个假阳性，而真肿瘤被删了。
-        # 这种情况下，我们放弃清洗 WT，保留原样。
-        new_has_tc = np.any((result_step1 == 1) | (result_step1 == 3))
-        if orig_has_tc and not new_has_tc:
-            # 触发 WT 回退：保留所有 WT 连通域，不删了
-            pass
-        else:
-            # 安全，应用清洗
-            result = result_step1
+            # 执行清洗
+            result_step1 = np.copy(result)
+            result_step1[~wt_keep_mask] = 0
 
-    # 更新清洗后的 WT 范围
+            # [Safety Net] 如果清洗 WT 导致 TC 全部丢失，说明预测的主 WT 可能是水肿，而真 TC 在另一个小 WT 里
+            # 这种情况下，放弃本次 WT 清洗，保留原样
+            new_has_tc = np.any((result_step1 == 1) | (result_step1 == 3))
+            if orig_has_tc and not new_has_tc:
+                pass  # 触发回退，不做操作
+            else:
+                result = result_step1
+
+    # 更新 WT 掩膜
     wt_clean_mask = (result > 0)
 
-    # === Step 2: 约束 TC (必须在 WT 内) ===
-    # 找到跑出 WT 范围的 TC
+    # === Step 2: TC (Tumor Core) 处理 ===
+    # 先清除跑出 WT 范围的 TC (设为 2: Edema，保持 WT 形状完整)
     tc_outliers = ((result == 1) | (result == 3)) & (~wt_clean_mask)
+    result[tc_outliers] = 2
 
-    # [Safety Check 2] 如果把 Outliers 删掉后，TC 就全没了？
-    # 计算如果删掉后的 TC 数量
-    current_tc_mask = ((result == 1) | (result == 3))
-    # 剩下的 TC = 当前 TC - Outliers
-    remaining_tc = current_tc_mask & (~tc_outliers)
+    # 处理 TC 连通域
+    tc_mask = (result == 1) | (result == 3)
+    if np.any(tc_mask):
+        labeled_tc, num_tc = ndimage.label(tc_mask)
+        sizes_tc = ndimage.sum(tc_mask, labeled_tc, range(1, num_tc + 1))
 
-    if orig_has_tc and not np.any(remaining_tc):
-        # 触发 TC 回退：不要强制约束"TC必须在WT内"
-        # 这种情况通常发生在 WT 预测偏了，但 TC 预测对了
-        pass
-    else:
-        # 安全，执行删除
-        result[tc_outliers] = 0
+        # [核心修正] TC 也只保留最大连通域 (防止离散噪点)
+        if num_tc > 0:
+            max_tc_idx = np.argmax(sizes_tc) + 1
+            # 将非最大的 TC 区域降级为 Edema (Label 2)
+            # 这样既去除了 TC 噪点，又不会让 WT 出现空洞
+            mask_not_max = (labeled_tc != max_tc_idx) & tc_mask
+            result[mask_not_max] = 2
 
-        # === Step 3: 约束 ET (必须在 TC 内) ===
-    # 这里我们只移除极小噪点，不强制"必须在TC内"（防止TC被误删导致ET也被误删）
+    # === Step 3: ET (Enhancing Tumor) 处理 ===
+    # ET 必须在 TC 内 (Step 2 已经确立了 TC 范围)
+    current_tc_mask = (result == 1) | (result == 3)
     et_mask = (result == 3)
+
+    # 清除跑出 TC 范围的 ET (设为 1: NCR)
+    et_outliers = et_mask & (~current_tc_mask)
+    result[et_outliers] = 1
+
+    # ET 允许保留多个块 (应对多发强化)，但去除极小噪点
+    et_mask = (result == 3)  # 更新 mask
     if np.any(et_mask):
         labeled_et, num_et = ndimage.label(et_mask)
-        if num_et > 0:
-            sizes_et = ndimage.sum(et_mask, labeled_et, range(1, num_et + 1))
-            # 移除小于 10 个体素的极小 ET 噪点
-            # 这里的 Safety Check 是：如果移除后 ET 全没了，就保留最大的那个
-            small_indices = np.where(sizes_et < 10)[0] + 1
+        sizes_et = ndimage.sum(et_mask, labeled_et, range(1, num_et + 1))
 
-            # 如果所有 ET 都是小的 (例如总共就 5 个体素)，全删了就 374 了
-            # 所以：只有当"删除会导致 ET 清零"时，我们才豁免最大的那个
-            if len(small_indices) == num_et:  # 也就是所有块都是小的
-                # 豁免最大的那个小块
-                max_small_idx = np.argmax(sizes_et) + 1
-                small_indices = small_indices[small_indices != max_small_idx]
+        # 找到小于阈值的噪点
+        small_et_indices = np.where(sizes_et < min_size_et)[0] + 1
 
-            if len(small_indices) > 0:
-                result[np.isin(labeled_et, small_indices)] = 1  # 退化为核心
+        # 如果所有 ET 都是小的，保留最大的那个 (防止 ET Dice 归零)
+        if len(small_et_indices) == num_et and num_et > 0:
+            max_idx = np.argmax(sizes_et) + 1
+            small_et_indices = small_et_indices[small_et_indices != max_idx]
+
+        # 将噪点 ET 退化为 NCR (Label 1)
+        mask_remove = np.isin(labeled_et, small_et_indices)
+        result[mask_remove] = 1
 
     return result
-
 
 # ==========================================
 # 3. 计算入口 (自动集成后处理)
@@ -147,7 +152,7 @@ def postprocess_hierarchical(pred_mask, min_size=200):
 def calculate_metrics_from_mask(pred_mask, target_mask):
     # [关键修复]：在此处内部调用后处理！
     # 这样 train_fednas_full.py 只需要调这个函数，不用管后处理
-    pred_mask_clean = postprocess_hierarchical(pred_mask, min_size=200)
+    pred_mask_clean = postprocess_hierarchical(pred_mask, min_size_wt=50, min_size_tc=30, min_size_et=10)
 
     p_wt, p_tc, p_et = get_brats_regions(pred_mask_clean)
     t_wt, t_tc, t_et = get_brats_regions(target_mask)
@@ -174,7 +179,7 @@ def calculate_brats_metrics(preds, targets):
 # ==========================================
 # 4. 推理函数 (加入 Logit Reweighting 救 Dice)
 # ==========================================
-def sliding_window_inference(inputs, model, window_size=(96, 96, 96), num_classes=4, overlap=0.5):
+def sliding_window_inference(inputs, model, window_size=(96, 96, 96), num_classes=4, overlap=0.5,sw_weights=None):
     """
     滑动窗口推理 + Logit Reweighting
     """
@@ -204,11 +209,17 @@ def sliding_window_inference(inputs, model, window_size=(96, 96, 96), num_classe
     # 平均 Logits
     avg_logits = output_sum / count_map
 
-    # === [关键改进] Logit Reweighting ===
-    # 针对 BraTS-00014 这种小肿瘤漏报的情况
-    # 人为放大 TC(1) 和 ET(3) 的 Logits 值，让模型更容易选它们
-    avg_logits[:, 1, ...] *= 1.50  # 强力提升 TC 召回
-    avg_logits[:, 3, ...] *= 1.35  # 强力提升 ET 召回
+    # === Logit Reweighting ===
+    if sw_weights is not None:
+        # 使用传入的权重
+        w_tensor = torch.tensor(sw_weights, device=inputs.device).view(1, num_classes, 1, 1, 1)
+        avg_logits = avg_logits * w_tensor
+    else:
+        # [建议修改] 默认使用更温和的权重
+        # 1.2 倍足以提升召回，又不至于产生太多假阳性
+        # BG=1.0, NCR=1.2, ED=1.0, ET=1.2
+        avg_logits[:, 1, ...] *= 1.2
+        avg_logits[:, 3, ...] *= 1.2
 
     return avg_logits
 
