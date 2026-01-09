@@ -65,6 +65,11 @@ class BarlowLoss(nn.Module):
         Args:
             z1, z2: (N, D) projected features (not normalized yet)
         """
+        # === [修改] 强制转换为 float32 以避免 FP16 下的数值不稳定 ===
+        z1 = z1.float()
+        z2 = z2.float()
+        # =======================================================
+
         N, D = z1.shape
 
         # 保护机制：如果 Batch=1，BN 和相关性计算都会失败

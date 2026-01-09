@@ -128,7 +128,8 @@ class BarlowClient:
             batch_size=getattr(self.args, 'barlow_bs', 2),
             shuffle=True,
             num_workers=2,
-            pin_memory=True
+            pin_memory=True,
+            drop_last=True  # === [新增] 防止最后一个 Batch 过小导致 BN 崩溃 ===
         )
 
         for batch in dataloader:

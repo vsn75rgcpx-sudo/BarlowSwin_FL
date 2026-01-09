@@ -51,7 +51,7 @@ os.makedirs(RESULT_DIR, exist_ok=True)
 CONFIG = {
     "device": "cuda" if torch.cuda.is_available() else "cpu",
     "num_clients": 4,
-    "num_workers": 0,
+    "num_workers": 8,
 
     # Stage 0: Barlow Twins
     "barlow_rounds": 20,

@@ -261,3 +261,29 @@ def jaccard_score(output, target):
                 ious.append(intersection / union)
         valid_ious = [x for x in ious if not torch.isnan(torch.tensor(x))]
         return torch.tensor(valid_ious).mean().item() if valid_ious else 0.0
+
+
+# 5. 适配器 (修复 AttributeError: 'metrics' has no attribute 'dice_score')
+# ==========================================
+def dice_score(preds, targets):
+    """
+    适配 fl_client.py 的调用。
+    计算一个 Batch 内所有样本的 BraTS Mean Dice 平均值。
+    """
+    # preds: (B, C, D, H, W)
+    # targets: (B, D, H, W)
+    batch_size = preds.shape[0]
+    total_dice = 0.0
+
+    # 遍历 Batch 中的每一个样本单独计算 (因为 calculate_brats_metrics 目前只处理单张)
+    for i in range(batch_size):
+        # 取出单个样本，保持维度 (1, C, D, H, W) 和 (1, D, H, W)
+        p_single = preds[i:i + 1]
+        t_single = targets[i:i + 1]
+
+        # 调用现有的计算函数
+        # 注意：calculate_brats_metrics 返回的是字典 {'Dice_Mean': ..., ...}
+        res = calculate_brats_metrics(p_single, t_single)
+        total_dice += res["Dice_Mean"]
+
+    return total_dice / max(1, batch_size)
